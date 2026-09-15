@@ -37,6 +37,18 @@ struct Incident {
     double baseline_mean = 0.0;
 };
 
+struct ActionRecord {
+    std::string id;              // generated if left empty when recorded
+    std::string action_type;     // e.g. "change_power_mode"
+    std::string reason;
+    std::string previous_state;  // exact prior state, opaque to the broker (e.g. a GUID string)
+    std::string new_state;
+    bool success = false;
+    bool rollback_available = false;
+    bool rolled_back = false;
+    int64_t created_at_ms = 0;  // filled in if left 0 when recorded
+};
+
 // Owns one SQLite database file. Single-writer by contract: callers must not
 // insert from more than one thread concurrently (see README/design notes on
 // the single-writer pattern).
@@ -72,6 +84,14 @@ public:
     // since they're produced on the same tick by the same sampler loop.
     void insert_events(const std::vector<SystemEvent>& events);
     std::vector<SystemEvent> query_recent_events(int64_t since_ms, int limit = 50);
+
+    // The Action Broker's audit trail: every mutation attempted, approved or
+    // not, successful or not. See PRD's "every autonomous investigation
+    // should be reproducible" / "comprehensive action logs" requirements.
+    std::string record_action(const ActionRecord& record);  // returns the (possibly generated) id
+    std::optional<ActionRecord> get_action(const std::string& id);
+    std::vector<ActionRecord> query_recent_actions(int limit = 20);
+    void mark_action_rolled_back(const std::string& id);
 
 private:
     sqlite3* db_ = nullptr;

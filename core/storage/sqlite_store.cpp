@@ -157,6 +157,25 @@ SqliteStore::SqliteStore(const std::string& db_path) {
         CREATE INDEX IF NOT EXISTS idx_events_ts
         ON system_events(ts);
     )SQL");
+
+    exec_or_throw(db_, R"SQL(
+        CREATE TABLE IF NOT EXISTS actions (
+            id TEXT PRIMARY KEY,
+            action_type TEXT NOT NULL,
+            reason TEXT,
+            previous_state TEXT,
+            new_state TEXT,
+            success INTEGER NOT NULL,
+            rollback_available INTEGER NOT NULL,
+            rolled_back INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+    )SQL");
+
+    exec_or_throw(db_, R"SQL(
+        CREATE INDEX IF NOT EXISTS idx_actions_created_at
+        ON actions(created_at);
+    )SQL");
 }
 
 SqliteStore::~SqliteStore() {
@@ -440,6 +459,120 @@ std::vector<SystemEvent> SqliteStore::query_recent_events(int64_t since_ms, int 
 
     sqlite3_finalize(stmt);
     return events;
+}
+
+namespace {
+
+ActionRecord read_action_row(sqlite3_stmt* stmt) {
+    ActionRecord record;
+    record.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+    record.action_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+
+    const unsigned char* reason = sqlite3_column_text(stmt, 2);
+    record.reason = reason ? reinterpret_cast<const char*>(reason) : "";
+    const unsigned char* prev = sqlite3_column_text(stmt, 3);
+    record.previous_state = prev ? reinterpret_cast<const char*>(prev) : "";
+    const unsigned char* next = sqlite3_column_text(stmt, 4);
+    record.new_state = next ? reinterpret_cast<const char*>(next) : "";
+
+    record.success = sqlite3_column_int(stmt, 5) != 0;
+    record.rollback_available = sqlite3_column_int(stmt, 6) != 0;
+    record.rolled_back = sqlite3_column_int(stmt, 7) != 0;
+    record.created_at_ms = sqlite3_column_int64(stmt, 8);
+    return record;
+}
+
+constexpr const char* kActionColumns =
+    "id, action_type, reason, previous_state, new_state, success, rollback_available, "
+    "rolled_back, created_at";
+
+}  // namespace
+
+std::string SqliteStore::record_action(const ActionRecord& input) {
+    ActionRecord record = input;
+    if (record.created_at_ms == 0) {
+        record.created_at_ms = current_timestamp_ms();
+    }
+    if (record.id.empty()) {
+        record.id = record.action_type + "-" + std::to_string(record.created_at_ms);
+    }
+
+    const char* sql =
+        "INSERT INTO actions (id, action_type, reason, previous_state, new_state, success, "
+        "rollback_available, rolled_back, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?);";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare insert-action statement");
+    }
+
+    sqlite3_bind_text(stmt, 1, record.id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, record.action_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, record.reason.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, record.previous_state.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, record.new_state.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 6, record.success ? 1 : 0);
+    sqlite3_bind_int(stmt, 7, record.rollback_available ? 1 : 0);
+    sqlite3_bind_int64(stmt, 8, record.created_at_ms);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("failed to insert action record");
+    }
+
+    sqlite3_finalize(stmt);
+    return record.id;
+}
+
+std::optional<ActionRecord> SqliteStore::get_action(const std::string& id) {
+    std::string sql = std::string("SELECT ") + kActionColumns + " FROM actions WHERE id = ?;";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare get-action query");
+    }
+    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<ActionRecord> result;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        result = read_action_row(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+std::vector<ActionRecord> SqliteStore::query_recent_actions(int limit) {
+    std::vector<ActionRecord> results;
+    std::string sql =
+        std::string("SELECT ") + kActionColumns + " FROM actions ORDER BY created_at DESC LIMIT ?;";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare recent-actions query");
+    }
+    sqlite3_bind_int(stmt, 1, limit);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        results.push_back(read_action_row(stmt));
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+void SqliteStore::mark_action_rolled_back(const std::string& id) {
+    const char* sql = "UPDATE actions SET rolled_back = 1 WHERE id = ?;";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare mark-rolled-back statement");
+    }
+    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("failed to mark action rolled back");
+    }
+    sqlite3_finalize(stmt);
 }
 
 }  // namespace sysintel

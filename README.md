@@ -18,12 +18,45 @@ This repo now spans two runtimes:
 - `sysintel watch` — `record` plus a battery anomaly check every 60 seconds, in one long-running loop (Phase 3)
 - `sysintel inspect [--db path]` — one unified snapshot: hardware inventory, live GPU state, and (with `--db`) recent events (Phase 3.5)
 - `sysintel events [--last minutes]` — process start/stop and AC connect/disconnect events, synthesized from the recorder without needing ETW
+- `sysintel act change-power-mode --level <best_power_efficiency|best_performance> [--reason "..."] [--yes]` — the first safe, reversible action: switches Windows 11's battery Power Mode, gated behind an explicit `--yes` (Phase 5)
+- `sysintel act rollback <action-id> [--yes]` — undoes a previous action, restoring its exact prior state
+- `sysintel actions [--last n]` — the action audit log
+- `sysintel power-schemes` — debug view of every power scheme/overlay Windows reports on this machine
 - every command above also takes `--json` for machine-readable output
 
 **A Python reasoning agent** (`intelligence/`, Phase 4 — the first AI-shaped piece, though not actually calling a model yet, see below):
 - `diagnose-battery` — investigates an open battery incident: collects evidence via the CLI's `--json` output, weighs it against a small set of hypotheses, and prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format
 
-Everything else (the native UI, AMD/Intel GPU telemetry, an actual LLM call) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+Everything else (the native UI, AMD/Intel GPU telemetry) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+
+### Phase 5: the Action Broker, and the first safe action
+
+Up to now this project only observes and explains. `sysintel act` is the first thing that can actually change the machine — and it's built around the PRD's Action Broker: permission check → (only if approved) execute → verify → audit record. There is exactly one path from a recommendation to a real change, and it isn't the Python agent or the LLM — it's this broker, invoked explicitly by a human.
+
+The action itself: **change the Windows 11 "Power Mode" slider** (Settings → System → Power), specifically the battery (DC) side of it — directly addressing the battery-drain scenario this whole project is built around. Two real, hardware-verified discoveries shaped this:
+
+1. **Classic multi-plan switching (`powercfg /list`-style) doesn't work on this dev machine at all** — it only has a single "Balanced" scheme registered, no "Power Saver"/"High Performance" to switch to. `enumerate_power_schemes()` and `powercfg /list` agree on this. So the *first* safe-action candidate (switch between classic power plans) was discarded before being built, in favor of the Power Mode slider, which works regardless of how many classic schemes exist.
+2. **The Power Mode overlay GUIDs are not the classic `GUID_MAX_POWER_SAVINGS`-style constants** — an earlier version of this code assumed they were reused; live testing on this machine proved that wrong (the API call succeeded but returned a GUID matching neither constant). The actual GUIDs were found by asking Windows directly — enumerate with `ACCESS_OVERLAY_SCHEME`, read each one's friendly name back — and cross-checked against what `PowerGetUserConfiguredDCPowerMode()` genuinely returned live. Only `best_power_efficiency`'s mapping has that live cross-check; `best_performance` is inferred from its reported name ("Max Performance Overlay") and flagged lower-confidence in the code.
+
+Verified end-to-end on the real machine: dry-run preview (no side effects, confirmed by independent re-read), real execution with independent verification, full audit trail, rollback restoring the *exact* prior state, and refusal paths (unknown level, double rollback, rollback of a nonexistent action id) all behaving correctly. The machine's power mode is back to exactly what it was before any of this testing started.
+
+```text
+$ sysintel act change-power-mode --level best_performance --reason "testing" --db sysintel.db
+Preview (not applied): dry run: would change DC power mode to 'best_performance'. Pass approval to apply.
+  Current state    961CC777-2547-4F9D-8174-7D86181B8A7A
+  Would become     DED574B5-45A0-4F42-8737-46345C09C238
+
+$ sysintel act change-power-mode --level best_performance --reason "testing" --db sysintel.db --yes
+Applied: changed and verified
+  Previous state   961CC777-2547-4F9D-8174-7D86181B8A7A
+  New state        DED574B5-45A0-4F42-8737-46345C09C238
+  Action id        change_power_mode-1789475388157  (use 'sysintel act rollback change_power_mode-1789475388157' to undo)
+
+$ sysintel act rollback change_power_mode-1789475388157 --db sysintel.db --yes
+Applied: rolled back and verified
+  Previous state   DED574B5-45A0-4F42-8737-46345C09C238
+  New state        961CC777-2547-4F9D-8174-7D86181B8A7A
+```
 
 ### Phase 3.5: a Unified System Model
 
@@ -335,6 +368,30 @@ flowchart TD
     GPUM -.-> AVAIL
 ```
 
+### Phase 5's addition: the Action Broker
+
+```mermaid
+flowchart TD
+    CLI4["sysintel act change-power-mode / rollback"]
+
+    subgraph BROKER["core/actions — the only path to a mutation"]
+        AB["action_broker.cpp: ActionBroker<br/>permission check -&gt; execute -&gt; verify -&gt; audit"]
+        PS["power_scheme.cpp<br/>enumerate/get/set power schemes + Power Mode overlay"]
+    end
+
+    WINPOWER[["Windows PowrProf API<br/>PowerGetUserConfiguredDCPowerMode()<br/>PowerSetUserConfiguredDCPowerMode()"]]
+
+    STORE4["SqliteStore<br/>record_action() / get_action()<br/>query_recent_actions() / mark_action_rolled_back()"]
+
+    CLI4 -->|"approved: bool (--yes)"| AB
+    AB -->|"only recognized action_type: change_power_mode"| PS
+    PS --> WINPOWER
+    AB -->|"always logs, approved or not, success or not"| STORE4
+    AB -.->|"rollback restores the EXACT previous_state,<br/>not a re-derived 'opposite' value"| PS
+```
+
+Notice the broker is the only node with an edge into `power_scheme.cpp`'s write functions (`set_dc_power_mode*`) — nothing else in this codebase, including the Python agent, can reach them. And notice `CLI4 -> AB` carries `approved` as an explicit boolean the *caller* controls (today, a `--yes` flag; later, a UI approval dialog) — the broker itself never decides to skip approval.
+
 ## What each file does, in easy words
 
 ### [`core/collectors/battery.hpp`](core/collectors/battery.hpp)
@@ -394,8 +451,9 @@ The history layer. Jobs:
 - `query_earliest_timestamp(metric)` — how far back a metric's history actually goes, used to gate anomaly evaluation until there's enough of it.
 - `open_incident()` / `get_open_incident()` / `resolve_incident()` — a tiny incident lifecycle: at most one *open* incident per domain at a time, so a persistent anomaly doesn't spam a new incident every check.
 - `insert_events(events)` / `query_recent_events(since, limit)` — the events pillar's storage, batched into the same transaction pattern as metric samples since they're produced by the same tick.
+- `record_action()` / `get_action()` / `query_recent_actions()` / `mark_action_rolled_back()` — the Action Broker's audit trail. Every attempted action is logged, success or failure, and rollback marks the original record rather than deleting it, so the history stays complete.
 
-The database also has exactly one index on `metric_samples`, on `(metric, timestamp)`; one on `incidents`, on `(domain, status)`; and one on `system_events`, on `(timestamp)` — all three built from the actual questions this project asks, not defensively.
+The database also has exactly one index on `metric_samples`, on `(metric, timestamp)`; one on `incidents`, on `(domain, status)`; one on `system_events`, on `(timestamp)`; and one on `actions`, on `(created_at)` — all four built from the actual questions this project asks, not defensively.
 
 Runs in "WAL mode," a SQLite setting that lets it survive a crash without corrupting data — worst case, we lose the last few unflushed seconds of samples, never the whole database.
 
@@ -411,6 +469,9 @@ Since this phase, it also calls `get_all_process_identities()` every tick and ha
 ### [`core/util/json.hpp`](core/util/json.hpp)
 The `json_escape`/`json_num` helpers, factored out once both `main.cpp`'s `--json` output and `sqlite_store.cpp`'s event-payload serialization needed the same small bit of string-escaping logic — better shared once than copied twice.
 
+### [`core/util/strings.hpp`](core/util/strings.hpp)
+Just `to_lower()`. Same story as `json.hpp` above, but for a helper that had quietly been copy-pasted into three different files (`system_inventory.cpp`, `gpu.cpp`, and now `power_scheme.cpp`) before finally being worth sharing.
+
 ### [`core/anomalies/battery_detector.hpp`](core/anomalies/battery_detector.hpp) / [`battery_detector.cpp`](core/anomalies/battery_detector.cpp)
 The "fast brain" for battery drain — no AI, just arithmetic on stored history. Each `check()` call:
 1. **Gate:** refuses to evaluate anything until history for `battery.discharge_watts` goes back at least `min_history_days` (14 by default, as requested) *and* has at least `min_baseline_samples` actual readings in that window — a technically-old-enough database that's mostly empty still won't trigger.
@@ -421,11 +482,25 @@ The "fast brain" for battery drain — no AI, just arithmetic on stored history.
 
 Because there are no recent `battery.discharge_watts` rows at all while a laptop is plugged in (the sampler only emits that metric while actually discharging — see `sampler.cpp` above), "no recent discharge samples" doubles as "we're on AC right now," with no separate flag needed.
 
+### [`core/actions/power_scheme.hpp`](core/actions/power_scheme.hpp) / [`power_scheme.cpp`](core/actions/power_scheme.cpp)
+Everything to do with Windows power schemes and the Power Mode slider. `enumerate_power_schemes()`/`get_active_power_scheme()`/`set_active_power_scheme()` wrap the *classic* multi-scheme API (`PowerEnumerate`, `PowerGetActiveScheme`, `PowerSetActiveScheme`) — built first, then discovered to be a dead end for this actual machine (only one classic scheme, "Balanced," is registered here; `powercfg /list` agrees). The functions this project's action actually uses are `get_dc_power_mode_raw_guid()`/`set_dc_power_mode()`/`set_dc_power_mode_raw_guid()`, wrapping the Windows 11 "Power Mode" slider API instead (`PowerGetUserConfiguredDCPowerMode`/`PowerSetUserConfiguredDCPowerMode`) — this works regardless of how many classic schemes exist.
+
+The two named `PowerModeLevel` GUIDs (`kOverlayBestPowerEfficiency`, `kOverlayBestPerformance`) are **not** the classic `GUID_MAX_POWER_SAVINGS`-style constants from `winnt.h`, even though they serve an analogous role — that assumption was made once, and disproven by testing live on this machine (the API call succeeded but returned a third, different GUID). The real values were found by enumerating with `ACCESS_OVERLAY_SCHEME` and reading each GUID's friendly name back from Windows itself, then cross-checking the "Better Battery-life Overlay" one against what `PowerGetUserConfiguredDCPowerMode()` actually returned live. Rollback deliberately works on the *raw GUID string*, not a named `PowerModeLevel` — it restores the exact prior value, including a "Balanced"/no-overlay state this code has no name for, rather than an approximation of it.
+
+### [`core/actions/action_broker.hpp`](core/actions/action_broker.hpp) / [`action_broker.cpp`](core/actions/action_broker.cpp)
+The PRD's Action Broker, and the only path from a recommendation to an actual change anywhere in this codebase — not the Python agent, not the LLM, nothing else. `execute()`:
+1. **Permission check:** an explicit allowlist (`action_type == "change_power_mode"`, currently the only recognized action). Anything else is refused before any state is read.
+2. **Dry run by default:** `approved=false` computes and returns the exact previous/new state so a caller can see precisely what would happen, but changes nothing and logs nothing.
+3. **Execute + verify:** `approved=true` applies the change, then independently re-reads the state to confirm it actually took — never trusting the Windows API's return code alone.
+4. **Always audit:** every approved attempt is logged via `SqliteStore::record_action()`, success or failure — matching the PRD's "every autonomous investigation should be reproducible" requirement.
+
+`rollback()` looks up a prior action's audit record and restores its exact `previous_state`, then logs the rollback itself as its own audit entry (so the trail stays complete) without offering a rollback-of-a-rollback, which isn't a concept this project needs.
+
 ### [`third_party/sqlite/`](third_party/sqlite)
 The SQLite database engine itself — `sqlite3.c` and `sqlite3.h`, downloaded directly from sqlite.org and compiled straight into our program. This is the normal way to use SQLite in a C/C++ project: it's public domain, this is officially how the SQLite team recommends including it, and it avoids needing a package manager just for one dependency.
 
 ### [`core/cli/main.cpp`](core/cli/main.cpp)
-The dashboard, now with seven modes (`status`, `history`, `check-battery`, `watch` also accept `--json`):
+The dashboard, now with eleven modes (`status`, `history`, `check-battery`, `watch`, `events` also accept `--json`):
 - `status [--json]` — the original one-shot report (unchanged behavior).
 - `record [--db path]` — starts the sampling loop against a SQLite file, runs until Ctrl+C.
 - `history <metric> [--last minutes] [--db path]` — reads back stored history and prints min/avg/max.
@@ -433,6 +508,10 @@ The dashboard, now with seven modes (`status`, `history`, `check-battery`, `watc
 - `watch [--db path] [--min-history-days n]` — `record`, plus a battery anomaly check every 60 seconds, in one loop.
 - `inspect [--db path]` — inventory + live GPU state + (with `--db`) recent events, all on one screen.
 - `events [--last minutes] [--limit n] [--db path]` — recent process/power events.
+- `act change-power-mode --level <...> [--reason text] [--db path] [--yes]` — the Action Broker's one safe action; without `--yes`, prints a dry-run preview and changes nothing.
+- `act rollback <action-id> [--db path] [--yes]` — undoes a previous action.
+- `actions [--last n] [--db path]` — the action audit log.
+- `power-schemes` — debug view of every classic scheme and Power Mode overlay Windows reports, plus which one is currently active.
 
 The `--json` output uses the hand-written helpers in `core/util/json.hpp`, not a JSON library — the object shapes here are small and fixed, so a real library would be machinery this project doesn't need yet, the same call made about not vendoring a package manager just for SQLite. This JSON is the entire contract the Python agent depends on.
 
@@ -468,7 +547,7 @@ Template for `intelligence/.env` (gitignored, never committed): `GROQ_API_KEY` a
 
 ### [`CMakeLists.txt`](CMakeLists.txt)
 The build recipe. Tells the compiler:
-- which `.cpp` files to compile (collectors, storage, sampler, anomaly detector, inventory, events, GPU dispatch, WMI/NVML providers, CLI) plus `sqlite3.c` as a C file,
+- which `.cpp` files to compile (collectors, storage, sampler, anomaly detector, inventory, events, GPU dispatch, WMI/NVML providers, power scheme + action broker, CLI) plus `sqlite3.c` as a C file,
 - to use C++20 for our own code,
 - where to find `sqlite3.h` (`third_party/sqlite`),
 - and to link against `pdh`, `powrprof`, `psapi`, `wbemuuid` (the last for WMI's COM API) — Windows' own pre-built libraries containing the real implementations of the functions we called. Without naming these, the compiler wouldn't know where those functions actually live. NVML needs no new link library at all, since it's loaded dynamically at runtime with `LoadLibrary` rather than linked at build time.
@@ -489,6 +568,12 @@ cmake --build build
 .\build\sysintel.exe check-battery --db sysintel.db   # one-shot anomaly check
 .\build\sysintel.exe inspect --db sysintel.db         # inventory + live GPU state + recent events
 .\build\sysintel.exe events --last 30 --db sysintel.db
+.\build\sysintel.exe power-schemes                    # debug view of schemes/Power Mode overlays
+
+.\build\sysintel.exe act change-power-mode --level best_power_efficiency --reason "battery drain" --db sysintel.db
+# ^ prints a dry-run preview only -- add --yes to actually apply it
+.\build\sysintel.exe act rollback <action-id> --db sysintel.db --yes
+.\build\sysintel.exe actions --db sysintel.db          # audit log of every action taken
 ```
 
 Battery anomaly checks require at least 14 days of accumulated `record`/`watch` history by default before they'll evaluate anything — pass `--min-history-days <n>` to override this for local testing against a shorter or synthetic dataset.
@@ -515,5 +600,7 @@ The agent now sees GPU state and events, and hypothesis selection is a real LLM 
 Worth flagging explicitly: this is a conscious departure from the tech design's original "don't let the LLM invent confidence" principle (§32) — that principle still holds for the *deterministic* parts of this system (the battery anomaly detector's threshold math never changed), but hypothesis selection specifically now trusts the model's confidence judgment, verified reasonable in testing. If that trust turns out to be misplaced on harder cases later, reintroducing a rubric-based confidence *ceiling* the LLM can't exceed would be a small, contained change to `llm.py`.
 
 The NVML path still specifically needs verification on real NVIDIA hardware before it's trustworthy — everything checkable without that hardware (dynamic-loading fallback, vendor dispatch, WMI-based inventory) has been.
+
+There's now a real Action Broker and one verified safe action (Phase 5), but nothing yet *calls* it automatically — `diagnose-battery`'s `recommended_action` is still just prose, and turning "Investigate which process is driving CPU usage" into an actual `sysintel act` invocation is a deliberate human/UI step this project hasn't built yet, matching the PRD's Level 2 ("Suggest") vs Level 3 ("Reversible action, approval required") distinction. The natural next action to add is one gated behind that same broker but touching something CPU-drain-specific (e.g. disabling a startup application) rather than only battery-mode; `best_performance`'s GUID mapping also still wants a live cross-check the way `best_power_efficiency` already got.
 
 Also still deliberately deferred: AMD/Intel GPU providers (currently always `unsupported`), true ETW-based event tracking (current events are polling-diffed, which misses anything that starts and exits between ~1s ticks), retention/rollup (collapse raw samples older than 24h into 1-minute aggregates, per the tech design), and the eventual named-pipe IPC to replace subprocess+JSON — none needed until their absence actually starts costing something.

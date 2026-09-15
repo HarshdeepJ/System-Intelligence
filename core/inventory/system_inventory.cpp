@@ -1,9 +1,7 @@
 #include "../model/system_inventory.hpp"
 
-#include <algorithm>
-#include <cctype>
-
 #include "../providers/windows/wmi_client.hpp"
+#include "../util/strings.hpp"
 
 namespace sysintel {
 
@@ -39,13 +37,6 @@ Reading<uint64_t> field_u64(const WmiRow& row, const std::string& key) {
     } catch (...) {
         return Reading<uint64_t>::unavailable();
     }
-}
-
-std::string to_lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s;
 }
 
 std::string infer_gpu_vendor(const std::string& name) {

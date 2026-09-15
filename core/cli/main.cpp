@@ -12,6 +12,8 @@
 #include "../collectors/cpu.hpp"
 #include "../collectors/memory.hpp"
 #include "../collectors/process.hpp"
+#include "../actions/action_broker.hpp"
+#include "../actions/power_scheme.hpp"
 #include "../model/gpu_state.hpp"
 #include "../model/system_inventory.hpp"
 #include "../sampler/sampler.hpp"
@@ -120,6 +122,39 @@ void print_reading(const std::string& label, const Reading<T>& r) {
 }
 
 void print_event(const SystemEvent& event);  // defined further below, used here for --db output
+
+int run_power_schemes() {
+    auto schemes = enumerate_power_schemes();
+    auto active = get_active_power_scheme();
+
+    std::cout << "Power schemes on this machine:\n\n";
+    if (schemes.empty()) {
+        std::cout << "  (none enumerated -- PowerEnumerate failed or returned nothing)\n";
+    }
+    for (const auto& s : schemes) {
+        bool is_active = active.has_value() && s.guid_string == active->guid_string;
+        std::cout << "  " << (is_active ? "* " : "  ") << s.friendly_name << "  [" << s.guid_string
+                   << "]" << (is_active ? "  (active)" : "") << "\n";
+    }
+
+    std::cout << "\nPower Mode slider (on battery / DC):\n";
+    std::string dc_guid = get_dc_power_mode_raw_guid();
+    if (dc_guid == guid_to_string(power_mode_guid(PowerModeLevel::kBestPowerEfficiency))) {
+        std::cout << "  " << power_mode_name(PowerModeLevel::kBestPowerEfficiency) << "  [" << dc_guid
+                   << "]\n";
+    } else if (dc_guid == guid_to_string(power_mode_guid(PowerModeLevel::kBestPerformance))) {
+        std::cout << "  " << power_mode_name(PowerModeLevel::kBestPerformance) << "  [" << dc_guid
+                   << "]\n";
+    } else {
+        std::cout << "  unrecognized/balanced  [" << dc_guid << "]\n";
+    }
+
+    std::cout << "\nOverlay schemes Windows itself reports (debug):\n";
+    for (const auto& s : debug_enumerate_overlay_schemes()) {
+        std::cout << "  " << s.friendly_name << "  [" << s.guid_string << "]\n";
+    }
+    return 0;
+}
 
 int run_inspect(const std::string& db_path) {
     SystemInventory inv = collect_system_inventory();
@@ -381,6 +416,70 @@ int run_events(const std::string& db_path, int last_minutes, int limit, bool as_
     return 0;
 }
 
+void print_action_outcome(const ActionOutcome& outcome) {
+    if (!outcome.known_action) {
+        std::cout << "Refused: " << outcome.message << "\n";
+        return;
+    }
+    if (!outcome.executed) {
+        std::cout << (outcome.success ? "No-op: " : "Preview (not applied): ") << outcome.message
+                   << "\n";
+        if (!outcome.previous_state.empty()) {
+            std::cout << "  Current state    " << outcome.previous_state << "\n";
+            std::cout << "  Would become     " << outcome.new_state << "\n";
+        }
+        return;
+    }
+    std::cout << (outcome.success ? "Applied: " : "FAILED: ") << outcome.message << "\n";
+    std::cout << "  Previous state   " << outcome.previous_state << "\n";
+    std::cout << "  New state        " << outcome.new_state << "\n";
+    if (!outcome.action_id.empty()) {
+        std::cout << "  Action id        " << outcome.action_id
+                   << "  (use 'sysintel act rollback " << outcome.action_id << "' to undo)\n";
+    }
+}
+
+int run_act_change_power_mode(const std::string& db_path, const std::string& level,
+                               const std::string& reason, bool approved) {
+    SqliteStore store(db_path);
+    ActionBroker broker(store);
+
+    ActionRequest request;
+    request.action_type = "change_power_mode";
+    request.reason = reason;
+    request.params["level"] = level;
+
+    print_action_outcome(broker.execute(request, approved));
+    return 0;
+}
+
+int run_act_rollback(const std::string& db_path, const std::string& action_id, bool approved) {
+    SqliteStore store(db_path);
+    ActionBroker broker(store);
+    print_action_outcome(broker.rollback(action_id, approved));
+    return 0;
+}
+
+int run_actions(const std::string& db_path, int limit) {
+    SqliteStore store(db_path);
+    auto actions = store.query_recent_actions(limit);
+
+    if (actions.empty()) {
+        std::cout << "No actions recorded yet.\n";
+        return 0;
+    }
+
+    std::cout << actions.size() << " most recent action(s):\n\n";
+    for (const auto& a : actions) {
+        std::cout << "  " << a.id << "  [" << a.action_type << "]"
+                   << (a.success ? "" : " FAILED") << (a.rolled_back ? " (rolled back)" : "")
+                   << "\n"
+                   << "    reason: " << a.reason << "\n"
+                   << "    " << a.previous_state << " -> " << a.new_state << "\n";
+    }
+    return 0;
+}
+
 void print_check_report(const BatteryCheckReport& report) {
     switch (report.result) {
         case BatteryCheckResult::kNotEnoughHistory:
@@ -503,6 +602,10 @@ void print_usage() {
                << "  sysintel watch [--db <path>] [--min-history-days <n>]\n"
                << "  sysintel history <metric> [--last <minutes>] [--db <path>] [--json]\n"
                << "  sysintel events [--last <minutes>] [--limit <n>] [--db <path>] [--json]\n"
+               << "  sysintel act change-power-mode --level <best_power_efficiency|best_performance> "
+                  "[--reason <text>] [--db <path>] [--yes]\n"
+               << "  sysintel act rollback <action-id> [--db <path>] [--yes]\n"
+               << "  sysintel actions [--last <n>] [--db <path>]\n"
                << "  sysintel check-battery [--db <path>] [--min-history-days <n>] [--json]\n";
 }
 
@@ -514,6 +617,10 @@ int main(int argc, char** argv) {
     if (command == "status") {
         bool as_json = argc > 2 && std::string(argv[2]) == "--json";
         return as_json ? run_status_json() : run_status();
+    }
+
+    if (command == "power-schemes") {
+        return run_power_schemes();
     }
 
     if (command == "inspect") {
@@ -578,6 +685,75 @@ int main(int argc, char** argv) {
             }
         }
         return run_events(db_path, last_minutes, limit, as_json);
+    }
+
+    if (command == "act") {
+        if (argc < 3) {
+            print_usage();
+            return 1;
+        }
+        std::string subcommand = argv[2];
+        std::string db_path = "sysintel.db";
+        bool approved = false;
+
+        if (subcommand == "change-power-mode") {
+            std::string level;
+            std::string reason = "manual";
+            for (int i = 3; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--level" && i + 1 < argc) {
+                    level = argv[++i];
+                } else if (arg == "--reason" && i + 1 < argc) {
+                    reason = argv[++i];
+                } else if (arg == "--db" && i + 1 < argc) {
+                    db_path = argv[++i];
+                } else if (arg == "--yes") {
+                    approved = true;
+                }
+            }
+            if (level.empty()) {
+                std::cerr << "usage: sysintel act change-power-mode --level "
+                             "<best_power_efficiency|best_performance> [--reason <text>] "
+                             "[--db <path>] [--yes]\n";
+                return 1;
+            }
+            return run_act_change_power_mode(db_path, level, reason, approved);
+        }
+
+        if (subcommand == "rollback") {
+            if (argc < 4) {
+                std::cerr << "usage: sysintel act rollback <action-id> [--db <path>] [--yes]\n";
+                return 1;
+            }
+            std::string action_id = argv[3];
+            for (int i = 4; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--db" && i + 1 < argc) {
+                    db_path = argv[++i];
+                } else if (arg == "--yes") {
+                    approved = true;
+                }
+            }
+            return run_act_rollback(db_path, action_id, approved);
+        }
+
+        std::cerr << "unknown 'act' subcommand: " << subcommand << "\n";
+        print_usage();
+        return 1;
+    }
+
+    if (command == "actions") {
+        std::string db_path = "sysintel.db";
+        int limit = 20;
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--last" && i + 1 < argc) {
+                limit = std::stoi(argv[++i]);
+            } else if (arg == "--db" && i + 1 < argc) {
+                db_path = argv[++i];
+            }
+        }
+        return run_actions(db_path, limit);
     }
 
     if (command == "watch" || command == "check-battery") {
