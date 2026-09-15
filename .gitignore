@@ -3,3 +3,6 @@ build/
 *.db
 *.db-wal
 *.db-shm
+intelligence/.venv/
+__pycache__/
+*.pyc

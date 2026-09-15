@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "../model/system_event.hpp"
 #include "metric_sample.hpp"
 
 struct sqlite3;  // forward declaration -- keeps sqlite3.h out of every includer
@@ -66,6 +67,11 @@ public:
                             const std::string& trigger_type, double observed_value,
                             double baseline_mean);
     void resolve_incident(const std::string& id, int64_t resolved_at_ms);
+
+    // Events: batched the same way metric samples are (one transaction),
+    // since they're produced on the same tick by the same sampler loop.
+    void insert_events(const std::vector<SystemEvent>& events);
+    std::vector<SystemEvent> query_recent_events(int64_t since_ms, int limit = 50);
 
 private:
     sqlite3* db_ = nullptr;

@@ -57,4 +57,25 @@ std::vector<ProcessInfo> get_top_processes_by_memory(int limit) {
     return processes;
 }
 
+std::vector<ProcessIdentity> get_all_process_identities() {
+    std::vector<ProcessIdentity> processes;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return processes;
+    }
+
+    PROCESSENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+
+    if (Process32First(snapshot, &entry)) {
+        do {
+            processes.push_back({entry.th32ProcessID, entry.szExeFile});
+        } while (Process32Next(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return processes;
+}
+
 }  // namespace sysintel

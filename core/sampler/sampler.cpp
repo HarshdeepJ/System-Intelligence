@@ -6,6 +6,7 @@
 #include "../collectors/battery.hpp"
 #include "../collectors/cpu.hpp"
 #include "../collectors/memory.hpp"
+#include "../collectors/process.hpp"
 
 namespace sysintel {
 
@@ -34,11 +35,15 @@ void Sampler::set_periodic_hook(std::chrono::seconds interval, std::function<voi
 
 void Sampler::run() {
     std::vector<MetricSample> buffer;
+    std::vector<SystemEvent> event_buffer;
 
     auto last_battery = std::chrono::steady_clock::now() - kBatterySampleInterval;
     auto last_memory = std::chrono::steady_clock::now() - kMemorySampleInterval;
     auto last_flush = std::chrono::steady_clock::now();
     auto last_hook = std::chrono::steady_clock::now();
+
+    bool known_battery_present = false;
+    bool known_on_ac_power = true;
 
     while (!stop_requested_.load()) {
         auto now = std::chrono::steady_clock::now();
@@ -47,8 +52,17 @@ void Sampler::run() {
         buffer.push_back(
             {"cpu.utilization", cpu.total_utilization_percent, "percent", current_timestamp_ms()});
 
+        // Cheap enough to call every tick (~1s): no per-process memory
+        // query, just a PID/name walk, purely to diff against last tick.
+        auto processes = get_all_process_identities();
+        auto new_events =
+            event_detector_.detect(processes, known_battery_present, known_on_ac_power);
+        event_buffer.insert(event_buffer.end(), new_events.begin(), new_events.end());
+
         if (now - last_battery >= kBatterySampleInterval) {
             BatterySnapshot battery = get_battery_snapshot();
+            known_battery_present = battery.battery_present;
+            known_on_ac_power = battery.on_ac_power;
             if (battery.battery_present) {
                 buffer.push_back({"battery.charge_percent",
                                    static_cast<double>(battery.charge_percent), "percent",
@@ -81,7 +95,13 @@ void Sampler::run() {
 
         if (now - last_flush >= kFlushInterval) {
             store_.insert_batch(buffer);
-            std::cout << "[recorder] flushed " << buffer.size() << " samples\n";
+            std::cout << "[recorder] flushed " << buffer.size() << " samples";
+            if (!event_buffer.empty()) {
+                store_.insert_events(event_buffer);
+                std::cout << ", " << event_buffer.size() << " events";
+                event_buffer.clear();
+            }
+            std::cout << "\n";
             buffer.clear();
             last_flush = now;
         }
@@ -94,6 +114,10 @@ void Sampler::run() {
                 buffer.clear();
                 last_flush = now;
             }
+            if (!event_buffer.empty()) {
+                store_.insert_events(event_buffer);
+                event_buffer.clear();
+            }
             hook_();
             last_hook = now;
         }
@@ -101,6 +125,9 @@ void Sampler::run() {
 
     if (!buffer.empty()) {
         store_.insert_batch(buffer);
+    }
+    if (!event_buffer.empty()) {
+        store_.insert_events(event_buffer);
     }
 }
 

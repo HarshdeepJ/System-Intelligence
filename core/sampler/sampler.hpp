@@ -3,6 +3,7 @@
 #include <chrono>
 #include <functional>
 
+#include "../events/event_detector.hpp"
 #include "../storage/sqlite_store.hpp"
 
 namespace sysintel {
@@ -37,6 +38,8 @@ private:
 
     std::chrono::seconds hook_interval_{0};
     std::function<void()> hook_;
+
+    SystemEventDetector event_detector_;
 };
 
 }  // namespace sysintel

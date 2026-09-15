@@ -2,8 +2,12 @@
 
 #include <sqlite3.h>
 
+#include <cctype>
 #include <cmath>
+#include <sstream>
 #include <stdexcept>
+
+#include "../util/json.hpp"
 
 namespace sysintel {
 
@@ -16,6 +20,78 @@ void exec_or_throw(sqlite3* db, const char* sql) {
         sqlite3_free(err_msg);
         throw std::runtime_error("sqlite error: " + message);
     }
+}
+
+std::string serialize_event_data(const std::unordered_map<std::string, std::string>& data) {
+    std::ostringstream out;
+    out << "{";
+    bool first = true;
+    for (const auto& [key, value] : data) {
+        if (!first) out << ",";
+        first = false;
+        out << "\"" << json_escape(key) << "\":\"" << json_escape(value) << "\"";
+    }
+    out << "}";
+    return out.str();
+}
+
+// A narrow parser for exactly the flat {"key":"value",...} shape
+// serialize_event_data produces above -- not a general JSON parser, since
+// this project only ever needs to read back what it wrote itself.
+std::unordered_map<std::string, std::string> parse_event_data(const std::string& payload) {
+    std::unordered_map<std::string, std::string> data;
+    size_t i = 0;
+
+    auto skip_ws = [&]() {
+        while (i < payload.size() && std::isspace(static_cast<unsigned char>(payload[i]))) ++i;
+    };
+    auto parse_string = [&]() -> std::string {
+        std::string result;
+        if (i >= payload.size() || payload[i] != '"') return result;
+        ++i;
+        while (i < payload.size() && payload[i] != '"') {
+            if (payload[i] == '\\' && i + 1 < payload.size()) {
+                char next = payload[i + 1];
+                switch (next) {
+                    case 'n':
+                        result += '\n';
+                        break;
+                    case 'r':
+                        result += '\r';
+                        break;
+                    case 't':
+                        result += '\t';
+                        break;
+                    default:
+                        result += next;
+                }
+                i += 2;
+            } else {
+                result += payload[i];
+                ++i;
+            }
+        }
+        if (i < payload.size()) ++i;  // closing quote
+        return result;
+    };
+
+    skip_ws();
+    if (i < payload.size() && payload[i] == '{') ++i;
+    while (i < payload.size()) {
+        skip_ws();
+        if (i >= payload.size() || payload[i] == '}') break;
+        std::string key = parse_string();
+        skip_ws();
+        if (i < payload.size() && payload[i] == ':') ++i;
+        skip_ws();
+        std::string value = parse_string();
+        data[key] = value;
+        skip_ws();
+        if (i < payload.size() && payload[i] == ',') {
+            ++i;
+        }
+    }
+    return data;
 }
 
 }  // namespace
@@ -66,6 +142,20 @@ SqliteStore::SqliteStore(const std::string& db_path) {
     exec_or_throw(db_, R"SQL(
         CREATE INDEX IF NOT EXISTS idx_incidents_domain_status
         ON incidents(domain, status);
+    )SQL");
+
+    exec_or_throw(db_, R"SQL(
+        CREATE TABLE IF NOT EXISTS system_events (
+            id INTEGER PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+    )SQL");
+
+    exec_or_throw(db_, R"SQL(
+        CREATE INDEX IF NOT EXISTS idx_events_ts
+        ON system_events(ts);
     )SQL");
 }
 
@@ -288,6 +378,68 @@ void SqliteStore::resolve_incident(const std::string& id, int64_t resolved_at_ms
     }
 
     sqlite3_finalize(stmt);
+}
+
+void SqliteStore::insert_events(const std::vector<SystemEvent>& events) {
+    if (events.empty()) {
+        return;
+    }
+
+    exec_or_throw(db_, "BEGIN TRANSACTION;");
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "INSERT INTO system_events (ts, type, payload_json) VALUES (?, ?, ?);";
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        exec_or_throw(db_, "ROLLBACK;");
+        throw std::runtime_error("failed to prepare insert-event statement");
+    }
+
+    for (const auto& event : events) {
+        sqlite3_reset(stmt);
+        sqlite3_bind_int64(stmt, 1, event.timestamp_ms);
+        sqlite3_bind_text(stmt, 2, event.type.c_str(), -1, SQLITE_TRANSIENT);
+        std::string payload = serialize_event_data(event.data);
+        sqlite3_bind_text(stmt, 3, payload.c_str(), -1, SQLITE_TRANSIENT);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            exec_or_throw(db_, "ROLLBACK;");
+            throw std::runtime_error("failed to insert system event");
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    exec_or_throw(db_, "COMMIT;");
+}
+
+std::vector<SystemEvent> SqliteStore::query_recent_events(int64_t since_ms, int limit) {
+    std::vector<SystemEvent> events;
+
+    const char* sql =
+        "SELECT ts, type, payload_json FROM system_events WHERE ts >= ? "
+        "ORDER BY ts DESC LIMIT ?;";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare recent-events query");
+    }
+
+    sqlite3_bind_int64(stmt, 1, since_ms);
+    sqlite3_bind_int(stmt, 2, limit);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        SystemEvent event;
+        event.timestamp_ms = sqlite3_column_int64(stmt, 0);
+        event.type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        const unsigned char* payload = sqlite3_column_text(stmt, 2);
+        if (payload) {
+            event.data = parse_event_data(reinterpret_cast<const char*>(payload));
+        }
+        events.push_back(std::move(event));
+    }
+
+    sqlite3_finalize(stmt);
+    return events;
 }
 
 }  // namespace sysintel

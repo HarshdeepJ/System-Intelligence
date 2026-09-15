@@ -12,6 +12,11 @@ add_executable(sysintel
     core/storage/sqlite_store.cpp
     core/sampler/sampler.cpp
     core/anomalies/battery_detector.cpp
+    core/providers/windows/wmi_client.cpp
+    core/providers/nvidia/nvml_provider.cpp
+    core/inventory/system_inventory.cpp
+    core/events/event_detector.cpp
+    core/collectors/gpu.cpp
     core/cli/main.cpp
     third_party/sqlite/sqlite3.c
 )
