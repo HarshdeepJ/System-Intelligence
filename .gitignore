@@ -6,3 +6,4 @@ build/
 intelligence/.venv/
 __pycache__/
 *.pyc
+intelligence/.env

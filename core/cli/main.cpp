@@ -30,11 +30,47 @@ double bytes_to_mb(uint64_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
+// JSON encoding of a Reading<T>: {"value": ... | null, "availability": "..."}
+// -- this is how Python's side ever gets to see the ok/unsupported/
+// unavailable/error distinction, not just a bare value.
+std::string json_reading_value(const std::string& v) { return "\"" + json_escape(v) + "\""; }
+std::string json_reading_value(int v) { return std::to_string(v); }
+std::string json_reading_value(uint64_t v) { return std::to_string(v); }
+std::string json_reading_value(double v) { return json_num(v); }
+
+template <typename T>
+std::string json_reading(const Reading<T>& r) {
+    std::ostringstream out;
+    out << "{\"value\":" << (r.value.has_value() ? json_reading_value(*r.value) : "null")
+        << ",\"availability\":\"" << availability_name(r.availability) << "\"}";
+    return out.str();
+}
+
+std::string json_gpu_array(const std::vector<GpuState>& gpus) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < gpus.size(); ++i) {
+        if (i > 0) out << ",";
+        const auto& g = gpus[i];
+        out << "{\"vendor\":\"" << json_escape(g.vendor) << "\",\"model\":\""
+            << json_escape(g.model) << "\""
+            << ",\"utilization_percent\":" << json_reading(g.utilization_percent)
+            << ",\"used_vram_bytes\":" << json_reading(g.used_vram_bytes)
+            << ",\"total_vram_bytes\":" << json_reading(g.total_vram_bytes)
+            << ",\"temperature_celsius\":" << json_reading(g.temperature_celsius)
+            << ",\"power_watts\":" << json_reading(g.power_watts)
+            << ",\"performance_state\":" << json_reading(g.performance_state) << "}";
+    }
+    out << "]";
+    return out.str();
+}
+
 int run_status_json() {
     BatterySnapshot battery = get_battery_snapshot();
     CpuSnapshot cpu = get_cpu_snapshot();
     MemorySnapshot mem = get_memory_snapshot();
     auto processes = get_top_processes_by_memory(8);
+    auto gpus = collect_gpu_state();
 
     std::ostringstream out;
     out << "{";
@@ -55,6 +91,8 @@ int run_status_json() {
     out << ",\"memory\":{\"total_bytes\":" << mem.total_bytes
         << ",\"available_bytes\":" << mem.available_bytes
         << ",\"load_percent\":" << mem.memory_load_percent << "}";
+
+    out << ",\"gpu\":" << json_gpu_array(gpus);
 
     out << ",\"top_processes_by_memory\":[";
     for (size_t i = 0; i < processes.size(); ++i) {
@@ -300,10 +338,36 @@ void print_event(const SystemEvent& event) {
     std::cout << "\n";
 }
 
-int run_events(const std::string& db_path, int last_minutes, int limit) {
+std::string json_events_array(const std::vector<SystemEvent>& events) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < events.size(); ++i) {
+        if (i > 0) out << ",";
+        const auto& e = events[i];
+        out << "{\"timestamp_ms\":" << e.timestamp_ms << ",\"type\":\"" << json_escape(e.type)
+            << "\",\"data\":{";
+        bool first = true;
+        for (const auto& [key, value] : e.data) {
+            if (!first) out << ",";
+            first = false;
+            out << "\"" << json_escape(key) << "\":\"" << json_escape(value) << "\"";
+        }
+        out << "}}";
+    }
+    out << "]";
+    return out.str();
+}
+
+int run_events(const std::string& db_path, int last_minutes, int limit, bool as_json) {
     SqliteStore store(db_path);
     int64_t since_ms = current_timestamp_ms() - static_cast<int64_t>(last_minutes) * 60 * 1000;
     auto events = store.query_recent_events(since_ms, limit);
+
+    if (as_json) {
+        std::cout << "{\"last_minutes\":" << last_minutes
+                   << ",\"events\":" << json_events_array(events) << "}" << std::endl;
+        return 0;
+    }
 
     if (events.empty()) {
         std::cout << "No events in the last " << last_minutes << " minutes.\n";
@@ -438,7 +502,7 @@ void print_usage() {
                << "  sysintel record [--db <path>]\n"
                << "  sysintel watch [--db <path>] [--min-history-days <n>]\n"
                << "  sysintel history <metric> [--last <minutes>] [--db <path>] [--json]\n"
-               << "  sysintel events [--last <minutes>] [--limit <n>] [--db <path>]\n"
+               << "  sysintel events [--last <minutes>] [--limit <n>] [--db <path>] [--json]\n"
                << "  sysintel check-battery [--db <path>] [--min-history-days <n>] [--json]\n";
 }
 
@@ -500,6 +564,7 @@ int main(int argc, char** argv) {
         std::string db_path = "sysintel.db";
         int last_minutes = 60;
         int limit = 50;
+        bool as_json = false;
         for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--last" && i + 1 < argc) {
@@ -508,9 +573,11 @@ int main(int argc, char** argv) {
                 db_path = argv[++i];
             } else if (arg == "--limit" && i + 1 < argc) {
                 limit = std::stoi(argv[++i]);
+            } else if (arg == "--json") {
+                as_json = true;
             }
         }
-        return run_events(db_path, last_minutes, limit);
+        return run_events(db_path, last_minutes, limit, as_json);
     }
 
     if (command == "watch" || command == "check-battery") {

@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Union
 
-from .schemas import BatteryCheckReport, MetricHistory, SystemSnapshot
+from .schemas import BatteryCheckReport, EventsResult, MetricHistory, SystemSnapshot
 
 
 class SysIntelToolError(RuntimeError):
@@ -68,6 +68,20 @@ class SysIntelClient:
                 self._db,
                 "--min-history-days",
                 str(min_history_days),
+                "--json",
+            )
+        )
+
+    def get_recent_events(self, last_minutes: int = 60, limit: int = 50) -> EventsResult:
+        return EventsResult.model_validate(
+            self._run(
+                "events",
+                "--last",
+                str(last_minutes),
+                "--limit",
+                str(limit),
+                "--db",
+                self._db,
                 "--json",
             )
         )

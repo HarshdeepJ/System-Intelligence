@@ -7,9 +7,32 @@ agent's reasoning.
 """
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Generic, Literal, Optional, TypeVar
 
 from pydantic import BaseModel
+
+T = TypeVar("T")
+
+
+class Reading(BaseModel, Generic[T]):
+    """Mirrors core/model/availability.hpp's Reading<T> exactly: a value is
+    never just missing, it's missing *for a specific, distinguishable
+    reason* (unsupported on this hardware, transiently unavailable, or an
+    outright error)."""
+
+    value: Optional[T] = None
+    availability: Literal["ok", "unsupported", "unavailable", "error"]
+
+
+class GpuState(BaseModel):
+    vendor: str
+    model: str
+    utilization_percent: Reading[int]
+    used_vram_bytes: Reading[int]
+    total_vram_bytes: Reading[int]
+    temperature_celsius: Reading[int]
+    power_watts: Reading[float]
+    performance_state: Reading[str]
 
 
 class BatterySnapshot(BaseModel):
@@ -40,6 +63,7 @@ class SystemSnapshot(BaseModel):
     battery: BatterySnapshot
     cpu: CpuSnapshot
     memory: MemorySnapshot
+    gpu: list[GpuState] = []
     top_processes_by_memory: list[ProcessInfo]
 
 
@@ -81,3 +105,14 @@ class BatteryCheckReport(BaseModel):
     baseline_stddev_watts: float
     threshold_watts: float
     incident: Optional[Incident] = None
+
+
+class SystemEvent(BaseModel):
+    timestamp_ms: int
+    type: str
+    data: dict[str, str] = {}
+
+
+class EventsResult(BaseModel):
+    last_minutes: int
+    events: list[SystemEvent]

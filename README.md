@@ -85,31 +85,58 @@ ANOMALY DETECTED: battery-1789471660271
   Threshold 15.4 W
 ```
 
-And once there's an open incident, `python -m intelligence.main diagnose-battery` investigates it:
+And once there's an open incident, `python -m intelligence.main diagnose-battery` investigates it — hypothesis selection now goes to a real LLM call (Groq), with evidence collection staying entirely deterministic:
 
 ```text
-Finding
-  System-wide CPU workload is responsible
+[reasoned by: LLM (Groq)]
 
-Confidence: 70%
+Finding
+  System-wide CPU workload is responsible -- Battery power consumption (21.88 W) exceeds
+  the threshold (15.36 W), coinciding with a sharp rise in CPU utilization (75.8% recent
+  average vs 23.6% baseline).
+
+Confidence: 75%
 
 Evidence
-  - Battery discharge: 21.9W observed vs 8.4W baseline (threshold 15.4W)
-  - CPU utilization: 75.9% now vs 23.6% (24h average)
-  - Top processes by memory: msedge.exe (625 MB), Code.exe (378 MB), Code.exe (355 MB)
+  - Battery discharge: 21.88W observed vs 8.39W baseline (threshold 15.36W)
+  - Live battery watts (21.88) are well above both baseline and the defined threshold.
+  - CPU recent 5-minute average (75.8%) is far higher than its 24-hour baseline (23.6%),
+    matching the timing of the power spike.
+  - GPU telemetry is marked as unsupported, so no evidence can confirm or refute GPU
+    involvement.
 
 Alternative explanations
-  - Unexplained by anything this build can currently measure (likely GPU activity or a driver regression -- no collector for either yet)
+  - GPU activity is responsible (only meaningful when a GPU actually reports usable
+    telemetry -- most machines/vendors don't yet)
+  - Unexplained by evidence this agent currently checks
 
 Recommended action
-  Investigate which process is driving CPU usage; consider closing it or switching to a lower power plan.
+  Identify and limit the high-CPU processes, reduce background work, and consider
+  power-saving settings for the CPU.
 
 Risk
-  low -- this is a diagnosis only, no action was taken
+  Reducing or terminating active processes may interrupt work or degrade user experience.
 
 Expected result
-  Battery discharge should return toward the 8.4W baseline.
+  CPU utilization should drop toward baseline, bringing battery power draw back below
+  the threshold.
 ```
+
+When CPU is normal too, the same model correctly drops confidence rather than forcing an answer — verified side by side against the CPU-elevated case above:
+
+```text
+[reasoned by: LLM (Groq)]
+
+Finding
+  Unexplained by evidence this agent currently checks -- Battery power draw (21.95 W) is
+  well above the threshold (15.36 W), but CPU usage is only marginally higher than its
+  24h baseline and GPU telemetry is unavailable, leaving no concrete evidence for a
+  CPU- or GPU-driven cause.
+
+Confidence: 30%
+```
+
+If the LLM call fails for any reason (no API key, network error, malformed response), a deterministic rule-based fallback takes over automatically and says so explicitly (`[reasoned by: rule-based fallback]`) rather than crashing — verified by running with `GROQ_API_KEY` unset.
 
 `sysintel inspect` pulls inventory + live GPU state (and, with `--db`, recent events) into one screen:
 
@@ -233,15 +260,22 @@ flowchart TD
 
     subgraph PYPROC["A SEPARATE PROCESS: python -m intelligence.main"]
         TOOLS["tools.py: SysIntelClient<br/>the only way the agent touches the machine"]
-        SCHEMAS["schemas.py<br/>Pydantic models, validate the JSON on the way in"]
-        AGENT["agent.py: BatteryDiagnosticAgent<br/>TRIAGE -&gt; HYPOTHESES -&gt; EVIDENCE -&gt; EVALUATE -&gt; DIAGNOSIS"]
-        PYMAIN["main.py<br/>diagnose-battery"]
+        SCHEMAS["schemas.py<br/>Pydantic models incl. Reading[T], validate JSON on the way in"]
+        AGENT["agent.py: BatteryDiagnosticAgent<br/>TRIAGE -&gt; HYPOTHESES -&gt; EVIDENCE -&gt; (LLM or fallback) -&gt; EXPLAIN"]
+        LLM["llm.py: select_hypothesis()<br/>the ONLY thing that touches an LLM"]
+        PYMAIN["main.py<br/>diagnose-battery, prints reasoned_by"]
     end
 
+    GROQ[["Groq API<br/>(external service)"]]
+
     PYMAIN --> AGENT
-    AGENT -->|"get_battery_anomaly_status()<br/>get_system_snapshot()<br/>get_metric_history()"| TOOLS
+    AGENT -->|"get_battery_anomaly_status()<br/>get_system_snapshot()<br/>get_metric_history()<br/>get_recent_events()"| TOOLS
     TOOLS -.->|validates response into| SCHEMAS
-    TOOLS ==>|"subprocess: sysintel.exe status/history/check-battery --json<br/>(fixed subcommands + typed args, never a shell string)"| MAIN
+    TOOLS ==>|"subprocess: sysintel.exe status/history/check-battery/events --json<br/>(fixed subcommands + typed args, never a shell string)"| MAIN
+
+    AGENT -->|"fixed hypothesis list + deterministically-gathered evidence only"| LLM
+    LLM -->|"HTTPS, structured JSON response required"| GROQ
+    LLM -.->|"LlmUnavailableError on failure"| AGENT
 ```
 
 Nothing here talks to Windows directly except the four `collectors/` files — everything else (`main.cpp`, `sampler.cpp`) just asks a collector for its snapshot. That separation is deliberate: later, the background service and the AI reasoning layer will call these exact same collector functions, and none of the collector code will need to change.
@@ -403,26 +437,34 @@ The dashboard, now with seven modes (`status`, `history`, `check-battery`, `watc
 The `--json` output uses the hand-written helpers in `core/util/json.hpp`, not a JSON library — the object shapes here are small and fixed, so a real library would be machinery this project doesn't need yet, the same call made about not vendoring a package manager just for SQLite. This JSON is the entire contract the Python agent depends on.
 
 ### [`intelligence/schemas.py`](intelligence/schemas.py)
-Pydantic models that mirror the CLI's JSON output exactly — `BatterySnapshot`, `SystemSnapshot`, `MetricHistory`, `Incident`, `BatteryCheckReport`. Pydantic validates the shape on the way in, so if the C++ side's JSON ever drifts (a renamed field, a missing key), it fails loudly right here instead of as a confusing bug three layers into the agent's reasoning.
+Pydantic models that mirror the CLI's JSON output exactly — `BatterySnapshot`, `SystemSnapshot`, `MetricHistory`, `Incident`, `BatteryCheckReport`, `SystemEvent`/`EventsResult`, and a generic `Reading[T]` mirroring `core/model/availability.hpp`'s `Reading<T>` field-for-field (`value` + `ok`/`unsupported`/`unavailable`/`error`). `GpuState` uses `Reading[T]` for every metric, so the availability distinction survives the C++ → JSON → Python round trip intact. Pydantic validates the shape on the way in, so if the C++ side's JSON ever drifts, it fails loudly right here instead of as a confusing bug three layers into the agent's reasoning.
 
 ### [`intelligence/tools.py`](intelligence/tools.py)
-The agent's *only* way of touching the machine — this is literally the PRD's "Diagnostic Tool Interface." `SysIntelClient` exposes exactly three methods (`get_system_snapshot`, `get_metric_history`, `get_battery_anomaly_status`), each calling one fixed `sysintel.exe` subcommand via `subprocess.run` with a list of arguments — never a shell string. There is no method on this class that could execute an arbitrary command; the agent literally cannot construct one.
+The agent's *only* way of touching the machine — this is literally the PRD's "Diagnostic Tool Interface." `SysIntelClient` exposes `get_system_snapshot` (now includes `gpu`), `get_metric_history`, `get_battery_anomaly_status`, and `get_recent_events` — each calling one fixed `sysintel.exe` subcommand via `subprocess.run` with a list of arguments, never a shell string. There is no method on this class that could execute an arbitrary command; the agent literally cannot construct one.
+
+### [`intelligence/llm.py`](intelligence/llm.py)
+The entire LLM boundary, and nothing more than that. `select_hypothesis()` takes the fixed hypothesis list and whatever evidence `agent.py` already gathered deterministically, and asks Groq to (a) pick a winner from the *given* IDs — never invent a new one — and (b) write the confidence/finding/recommendation. The model has no tools and never touches the machine; every fact it reasons over was collected by plain function calls before it was ever consulted. Output is constrained to JSON validated against `LlmDiagnosisResult`, so a malformed or off-script response raises `LlmUnavailableError` instead of silently corrupting what gets printed. Reads `GROQ_API_KEY`/`GROQ_MODEL` from `intelligence/.env` (via `python-dotenv`), which is gitignored — the repo only ships `.env.example` as a template.
+
+**Note on the project's own confidence-scoring principle:** the tech design explicitly says not to let an LLM invent confidence numbers, preferring a fixed evidence-based rubric. This module deliberately does let the model set confidence, because that's specifically what was asked for in this round — verified in testing that it behaves reasonably (75% when CPU evidence strongly supports the winning hypothesis, 30% when it doesn't), but this is a conscious deviation from that earlier principle, not an oversight.
 
 ### [`intelligence/agent.py`](intelligence/agent.py)
-The reasoning loop: TRIAGE → GENERATE HYPOTHESES → COLLECT EVIDENCE → EVALUATE → DIAGNOSIS. `BatteryDiagnosticAgent.diagnose()`:
+The reasoning loop: TRIAGE → GENERATE HYPOTHESES → COLLECT EVIDENCE → EVALUATE/DIAGNOSIS (now delegated to `llm.py`) → EXPLAIN. `BatteryDiagnosticAgent.diagnose()`:
 1. Checks whether there's actually an open battery incident (TRIAGE) — bails out honestly if not, or if there isn't enough history yet.
-2. Considers exactly two hypotheses: "CPU workload explains it" (H1) or "unexplained by anything we can currently measure" (H2).
-3. Pulls CPU history (24h baseline vs last 5 minutes) and the current process list as evidence.
-4. If recent CPU is well above its normal baseline, H1 wins with real supporting evidence attached; otherwise H2 wins, explicitly naming what's missing (GPU, driver history) rather than guessing.
-5. Returns a `Diagnosis` in the PRD's format: Finding / Confidence / Evidence / Alternative explanations / Recommended action / Risk / Expected result.
+2. Holds three fixed hypotheses: CPU workload (H1), GPU activity (H2), or unexplained (H3).
+3. Deterministically gathers CPU history (24h baseline vs last 5 minutes), current GPU state (including its availability), the process list, and — new this round — recent events filtered to a window around the incident's start time, giving a list of processes that started right before the anomaly began.
+4. Hands hypotheses + evidence to `llm.select_hypothesis()`.
+5. If that raises `LlmUnavailableError` (no key, network failure, bad response), `_fallback_diagnose()` takes over: the same CPU-threshold logic the rule-based version always used, explicitly labeled as a fallback in its own evidence line rather than silently pretending to be the LLM path.
 
-This is deliberately **rule-based, not an LLM call** — with only two real hypotheses currently wired into this agent, a fixed rule set is honest and sufficient. A GPU collector now exists at the C++ layer (Phase 3.5) but isn't plumbed into `tools.py`/`schemas.py` yet, so this agent still can't see it; that plumbing plus a third real hypothesis is exactly where an actual model call starts earning its keep over the current rule-based step.
+Every `Diagnosis` carries a `reasoned_by` field (`"llm"` or `"rule-based"`), and `main.py` always prints which one actually ran — never letting a degraded response masquerade as a full one.
 
 ### [`intelligence/main.py`](intelligence/main.py)
-The Python entry point — `python -m intelligence.main diagnose-battery [--db path] [--sysintel-exe path] [--min-history-days n]`. Wires a `SysIntelClient` to a `BatteryDiagnosticAgent` and prints the resulting diagnosis.
+The Python entry point — `python -m intelligence.main diagnose-battery [--db path] [--sysintel-exe path] [--min-history-days n]`. Wires a `SysIntelClient` to a `BatteryDiagnosticAgent`, prints which reasoning path ran, then the diagnosis. Also reconfigures stdout to UTF-8 on the way in — Windows' console defaults to a legacy codepage that can't encode a lot of ordinary Unicode punctuation an LLM will happily produce (hit this for real: a narrow no-break space in one response crashed the print before this fix).
 
 ### [`intelligence/requirements.txt`](intelligence/requirements.txt)
-Just `pydantic`. Installed into its own virtual environment (`intelligence/.venv`, gitignored) rather than system-wide — keeps this project's dependencies from colliding with anything else on the machine.
+`pydantic`, `groq`, and `python-dotenv`. Installed into its own virtual environment (`intelligence/.venv`, gitignored) rather than system-wide — keeps this project's dependencies from colliding with anything else on the machine.
+
+### [`intelligence/.env.example`](intelligence/.env.example)
+Template for `intelligence/.env` (gitignored, never committed): `GROQ_API_KEY` and `GROQ_MODEL`. Copy it, fill in a real key.
 
 ### [`CMakeLists.txt`](CMakeLists.txt)
 The build recipe. Tells the compiler:
@@ -451,20 +493,27 @@ cmake --build build
 
 Battery anomaly checks require at least 14 days of accumulated `record`/`watch` history by default before they'll evaluate anything — pass `--min-history-days <n>` to override this for local testing against a shorter or synthetic dataset.
 
-The Python agent needs its own one-time setup:
+The Python agent needs its own one-time setup, including a Groq API key for the LLM reasoning step (get one at console.groq.com — free tier is enough for this):
 
 ```powershell
 python -m venv intelligence\.venv
 intelligence\.venv\Scripts\pip install -r intelligence\requirements.txt
 
+copy intelligence\.env.example intelligence\.env
+# now edit intelligence\.env and paste your real GROQ_API_KEY
+
 # once there's an open incident in the database (see `check-battery` above):
 intelligence\.venv\Scripts\python -m intelligence.main diagnose-battery --db sysintel.db --sysintel-exe build\sysintel.exe
 ```
 
+No key configured, or the API call fails for any reason? The agent automatically falls back to deterministic rule-based reasoning and says so explicitly (`[reasoned by: rule-based fallback]`) — it never silently produces a degraded result while claiming full reasoning.
+
 ## What's next
 
-The Phase 4 reasoning loop still doesn't see any of what Phase 3.5 just added — `tools.py`/`schemas.py` only expose battery/CPU/memory/process data, not GPU state or events. Wiring that in (extend `status --json` with a `gpu` field, add `get_recent_events()` to `SysIntelClient`, give the agent a real third hypothesis to weigh) is the natural next step, and it's also the point where a real LLM call starts earning its keep over the current rule-based hypothesis step — three-plus competing, evidence-backed hypotheses is where a fixed rule set stops being the honest choice.
+The agent now sees GPU state and events, and hypothesis selection is a real LLM call (Groq) with a verified deterministic fallback — both branches (CPU-elevated, CPU-normal) tested end-to-end and produced well-calibrated confidence (75% vs 30%) rather than a fixed number regardless of evidence strength.
 
-The NVML path specifically needs verification on real NVIDIA hardware before it's trustworthy — everything that could be checked without that hardware (the dynamic-loading fallback, vendor dispatch, WMI-based inventory) has been.
+Worth flagging explicitly: this is a conscious departure from the tech design's original "don't let the LLM invent confidence" principle (§32) — that principle still holds for the *deterministic* parts of this system (the battery anomaly detector's threshold math never changed), but hypothesis selection specifically now trusts the model's confidence judgment, verified reasonable in testing. If that trust turns out to be misplaced on harder cases later, reintroducing a rubric-based confidence *ceiling* the LLM can't exceed would be a small, contained change to `llm.py`.
 
-Also still deliberately deferred: AMD/Intel GPU providers (currently always `unsupported`), true ETW-based event tracking (current events are polling-diffed, which misses anything that starts and exits between ~1s ticks), and retention/rollup (collapse raw samples older than 24h into 1-minute aggregates, keep those for 30 days, per the tech design) — not needed until the database has actually been running long enough for it to matter.
+The NVML path still specifically needs verification on real NVIDIA hardware before it's trustworthy — everything checkable without that hardware (dynamic-loading fallback, vendor dispatch, WMI-based inventory) has been.
+
+Also still deliberately deferred: AMD/Intel GPU providers (currently always `unsupported`), true ETW-based event tracking (current events are polling-diffed, which misses anything that starts and exits between ~1s ticks), retention/rollup (collapse raw samples older than 24h into 1-minute aggregates, per the tech design), and the eventual named-pipe IPC to replace subprocess+JSON — none needed until their absence actually starts costing something.

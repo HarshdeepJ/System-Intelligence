@@ -7,10 +7,20 @@ from pathlib import Path
 from .agent import BatteryDiagnosticAgent, Diagnosis
 from .tools import SysIntelClient, SysIntelToolError
 
+# Windows' console defaults to a legacy codepage (cp1252) that can't encode
+# a lot of ordinary Unicode punctuation (curly quotes, narrow no-break
+# spaces, em dashes...) an LLM will happily produce. Reconfigure stdout to
+# UTF-8 so a model's word choice can never crash the CLI.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 def print_diagnosis(diagnosis: Diagnosis) -> None:
     # Matches the PRD's evidence model: Finding / Confidence / Evidence /
     # Alternative explanations / Recommended action / Risk / Expected result.
+    reasoning_label = "LLM (Groq)" if diagnosis.reasoned_by == "llm" else "rule-based fallback"
+    print(f"[reasoned by: {reasoning_label}]\n")
+
     print("Finding")
     print(f"  {diagnosis.finding}\n")
 
