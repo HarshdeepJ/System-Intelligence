@@ -14,8 +14,8 @@ This repo now spans two runtimes:
 - `sysintel status` — one-shot snapshot (Phase 1: prove we can read real data from Windows)
 - `sysintel record` — continuously samples battery/CPU/memory and stores it in SQLite (Phase 2: history)
 - `sysintel history <metric> --last <minutes>` — reads back min/avg/max over a time window
-- `sysintel check-battery` — runs one battery-drain anomaly check right now and prints the result (Phase 3)
-- `sysintel watch` — `record` plus a battery anomaly check every 60 seconds, in one long-running loop (Phase 3)
+- `sysintel check-battery` / `check-memory` / `check-cpu` — runs one anomaly check right now for that domain and prints the result (Phase 3 for battery; memory/cpu generalized in Phase 7)
+- `sysintel watch` — `record` plus a battery + memory + cpu anomaly check every 60 seconds, in one long-running loop (Phase 3, extended in Phase 7)
 - `sysintel inspect [--db path]` — one unified snapshot: hardware inventory, live GPU state, and (with `--db`) recent events (Phase 3.5)
 - `sysintel events [--last minutes]` — process start/stop and AC connect/disconnect events, synthesized from the recorder without needing ETW
 - `sysintel act change-power-mode --level <best_power_efficiency|best_performance> [--reason "..."] [--yes]` — the first safe, reversible action: switches Windows 11's battery Power Mode, gated behind an explicit `--yes` (Phase 5)
@@ -27,7 +27,31 @@ This repo now spans two runtimes:
 **A Python reasoning agent** (`intelligence/`, Phase 4 — real LLM reasoning via Groq, Phase 6 closes the loop into an actual action):
 - `diagnose-battery [--auto-approve] [--no-act]` — investigates an open battery incident: collects evidence via the CLI's `--json` output, sends it to an LLM for hypothesis selection, prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format, and — unless `--no-act` — offers a concrete, runnable action with an interactive approval prompt (or applies it automatically with `--auto-approve`)
 
-Everything else (the native UI, AMD/Intel GPU telemetry) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+Everything else (the native UI, AMD/Intel GPU telemetry, network/disk-I/O collectors, and the Python agent generalizing beyond battery) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+
+### Phase 7: one detector, three domains — the start of "diagnose everything"
+
+The direction from here is explicit: cover every hardware domain, not just battery. The first step toward that wasn't a new collector — it was noticing that the battery-drain detector's actual logic (trailing baseline mean/stddev vs. a short "right now" window, gated on accumulated history, hysteresis on resolve) had nothing battery-specific about it *except the metric name*. `core/anomalies/anomaly_detector.hpp/cpp` pulls that logic out into a metric-agnostic `AnomalyDetector`, and `battery_detector.cpp` is now a thin ~50-line wrapper that configures it with `battery.discharge_watts` and translates result names back to `BatteryCheckResult`'s existing enum — so the CLI's `check-battery --json` shape and Python's `schemas.py` didn't need to change at all.
+
+This was deliberately *not* built generic from day one (see the project's running "no premature abstraction" rule) — it only became a generic class once there was a second real domain to prove the abstraction against. That second and third domain are `check-memory` and `check-cpu`, reusing history the recorder was already collecting since Phase 2 — no new collector work needed for either. `sysintel watch` now checks all three every 60 seconds.
+
+Verified with seeded synthetic data for each new domain independently: real anomalies correctly detected with sensible baseline/threshold values (e.g. CPU baseline 17.1%, spike to 85.2%, threshold 48.2%; memory baseline 61.0%, spike to 95.2%, threshold 91.6%), no false positive on normal data, and — critically — a battery-specific regression test confirming `check-battery`'s behavior is bit-for-bit unchanged after the refactor (same incident IDs, same thresholds, same ongoing/no-duplicate behavior as the original Phase 3 test).
+
+```text
+$ sysintel check-cpu --db sysintel.db
+ANOMALY DETECTED (cpu): cpu-1789476582194
+  Observed  85.2%
+  Baseline  17.1%
+  Threshold 48.2%
+
+$ sysintel check-memory --db sysintel.db
+ANOMALY DETECTED (memory): memory-1789476582254
+  Observed  95.2%
+  Baseline  61.0%
+  Threshold 91.6%
+```
+
+Not yet done, and the natural continuation: the Python diagnostic agent still only knows how to investigate battery incidents (`get_battery_anomaly_status()`); memory and CPU anomalies are detected but nothing diagnoses *why* yet. New collectors (network, disk I/O, per-process CPU attribution, thermal/fan) are the next layer after that.
 
 ### Phase 6: closing the loop, from diagnosis to action
 
@@ -513,15 +537,20 @@ The `json_escape`/`json_num` helpers, factored out once both `main.cpp`'s `--jso
 ### [`core/util/strings.hpp`](core/util/strings.hpp)
 Just `to_lower()`. Same story as `json.hpp` above, but for a helper that had quietly been copy-pasted into three different files (`system_inventory.cpp`, `gpu.cpp`, and now `power_scheme.cpp`) before finally being worth sharing.
 
-### [`core/anomalies/battery_detector.hpp`](core/anomalies/battery_detector.hpp) / [`battery_detector.cpp`](core/anomalies/battery_detector.cpp)
-The "fast brain" for battery drain — no AI, just arithmetic on stored history. Each `check()` call:
-1. **Gate:** refuses to evaluate anything until history for `battery.discharge_watts` goes back at least `min_history_days` (14 by default, as requested) *and* has at least `min_baseline_samples` actual readings in that window — a technically-old-enough database that's mostly empty still won't trigger.
-2. **Baseline:** mean + standard deviation of discharge wattage over that same trailing window.
-3. **Right now:** mean discharge wattage over the last 5 minutes.
+### [`core/anomalies/anomaly_detector.hpp`](core/anomalies/anomaly_detector.hpp) / [`anomaly_detector.cpp`](core/anomalies/anomaly_detector.cpp)
+The "fast brain," generalized (Phase 7) — no AI, just arithmetic on stored history, and no longer tied to any one metric. Each `check()` call, parameterized by a `metric` (e.g. `cpu.utilization`) and a `domain` (e.g. `"cpu"`, matching the incidents table):
+1. **Gate:** refuses to evaluate anything until history for that metric goes back at least `min_history_days` (14 by default) *and* has at least `min_baseline_samples` actual readings in that window — a technically-old-enough database that's mostly empty still won't trigger.
+2. **Baseline:** mean + standard deviation over that same trailing window.
+3. **Right now:** mean over the last 5 minutes.
 4. **Rule:** flag an anomaly if "right now" exceeds `max(baseline_mean + 2.5·stddev, baseline_mean·1.5)` — whichever is the more forgiving of the two, so a very quiet, low-variance baseline doesn't get flagged by trivially small bumps.
-5. **Incident lifecycle:** opens one incident on first detection, recognizes it's already open on every subsequent check (no duplicate spam), and resolves it once discharge drops comfortably back near baseline (a deliberate hysteresis gap, so a reading right at the edge doesn't flip open/resolved on every check).
+5. **Incident lifecycle:** opens one incident on first detection, recognizes it's already open on every subsequent check (no duplicate spam), and resolves it once the metric drops comfortably back near baseline (a deliberate hysteresis gap, so a reading right at the edge doesn't flip open/resolved on every check).
 
-Because there are no recent `battery.discharge_watts` rows at all while a laptop is plugged in (the sampler only emits that metric while actually discharging — see `sampler.cpp` above), "no recent discharge samples" doubles as "we're on AC right now," with no separate flag needed.
+This class didn't exist until there were two real domains to prove it against (memory, cpu) — the original battery-only version (Phase 3) is what's described above; generalizing it a phase later, once the abstraction had something real to justify it, was a deliberate sequencing choice, not an oversight.
+
+### [`core/anomalies/battery_detector.hpp`](core/anomalies/battery_detector.hpp) / [`battery_detector.cpp`](core/anomalies/battery_detector.cpp)
+Now a thin wrapper (Phase 7) around `AnomalyDetector`, configured with `battery.discharge_watts`/`"battery"` and translating `AnomalyCheckResult` back to `BatteryCheckResult`'s own enum names (`kNoRecentDischarge` instead of the generic `kNoRecentSamples`, etc.) — so the CLI's `check-battery --json` shape and Python's `schemas.py` didn't need to change when this refactor happened. Regression-tested against the exact seeded scenario from Phase 3 to confirm identical behavior (same incident ID format, thresholds, and ongoing/no-duplicate logic).
+
+Because there are no recent `battery.discharge_watts` rows at all while a laptop is plugged in (the sampler only emits that metric while actually discharging — see `sampler.cpp` above), "no recent discharge samples" doubles as "we're on AC right now," with no separate flag needed — this is specific to battery, which is why the generic detector's equivalent result is named the more neutral `kNoRecentSamples`.
 
 ### [`core/actions/power_scheme.hpp`](core/actions/power_scheme.hpp) / [`power_scheme.cpp`](core/actions/power_scheme.cpp)
 Everything to do with Windows power schemes and the Power Mode slider. `enumerate_power_schemes()`/`get_active_power_scheme()`/`set_active_power_scheme()` wrap the *classic* multi-scheme API (`PowerEnumerate`, `PowerGetActiveScheme`, `PowerSetActiveScheme`) — built first, then discovered to be a dead end for this actual machine (only one classic scheme, "Balanced," is registered here; `powercfg /list` agrees). The functions this project's action actually uses are `get_dc_power_mode_raw_guid()`/`set_dc_power_mode()`/`set_dc_power_mode_raw_guid()`, wrapping the Windows 11 "Power Mode" slider API instead (`PowerGetUserConfiguredDCPowerMode`/`PowerSetUserConfiguredDCPowerMode`) — this works regardless of how many classic schemes exist.
@@ -541,12 +570,12 @@ The PRD's Action Broker, and the only path from a recommendation to an actual ch
 The SQLite database engine itself — `sqlite3.c` and `sqlite3.h`, downloaded directly from sqlite.org and compiled straight into our program. This is the normal way to use SQLite in a C/C++ project: it's public domain, this is officially how the SQLite team recommends including it, and it avoids needing a package manager just for one dependency.
 
 ### [`core/cli/main.cpp`](core/cli/main.cpp)
-The dashboard, now with eleven modes (`status`, `history`, `check-battery`, `watch`, `events` also accept `--json`):
+The dashboard, now with thirteen modes (`status`, `history`, `check-battery`/`check-memory`/`check-cpu`, `watch`, `events` also accept `--json`):
 - `status [--json]` — the original one-shot report (unchanged behavior).
 - `record [--db path]` — starts the sampling loop against a SQLite file, runs until Ctrl+C.
 - `history <metric> [--last minutes] [--db path]` — reads back stored history and prints min/avg/max.
-- `check-battery [--db path] [--min-history-days n]` — runs one battery anomaly check right now.
-- `watch [--db path] [--min-history-days n]` — `record`, plus a battery anomaly check every 60 seconds, in one loop.
+- `check-battery` / `check-memory` / `check-cpu` `[--db path] [--min-history-days n]` — runs one anomaly check right now for that domain, backed by the same generic `AnomalyDetector`.
+- `watch [--db path] [--min-history-days n]` — `record`, plus battery + memory + cpu anomaly checks every 60 seconds, in one loop.
 - `inspect [--db path]` — inventory + live GPU state + (with `--db`) recent events, all on one screen.
 - `events [--last minutes] [--limit n] [--db path]` — recent process/power events.
 - `act change-power-mode --level <...> [--reason text] [--db path] [--yes]` — the Action Broker's one safe action; without `--yes`, prints a dry-run preview and changes nothing.
@@ -643,16 +672,10 @@ No key configured, or the API call fails for any reason? The agent automatically
 
 ## What's next
 
-The agent now sees GPU state and events, and hypothesis selection is a real LLM call (Groq) with a verified deterministic fallback — both branches (CPU-elevated, CPU-normal) tested end-to-end and produced well-calibrated confidence (75% vs 30%) rather than a fixed number regardless of evidence strength.
+The stated direction now is comprehensive coverage: "all the information, diagnose everything," not just battery. Phase 7 generalized *detection* to three domains; what it deliberately didn't touch:
 
-Worth flagging explicitly: this is a conscious departure from the tech design's original "don't let the LLM invent confidence" principle (§32) — that principle still holds for the *deterministic* parts of this system (the battery anomaly detector's threshold math never changed), but hypothesis selection specifically now trusts the model's confidence judgment, verified reasonable in testing. If that trust turns out to be misplaced on harder cases later, reintroducing a rubric-based confidence *ceiling* the LLM can't exceed would be a small, contained change to `llm.py`.
+- **The Python agent still only diagnoses battery incidents.** `check-memory`/`check-cpu` will happily open incidents, but nothing investigates *why* yet — `BatteryDiagnosticAgent` needs to become domain-aware (or a `MemoryDiagnosticAgent`/`CpuDiagnosticAgent` need to exist alongside it), with per-domain hypothesis sets. This is the natural next slice.
+- **New collectors**, still needed for real domain coverage: network (a whole original MVP domain with zero coverage so far), disk I/O throughput/IOPS (currently only static disk *inventory* exists, no live activity), per-process CPU attribution (a known gap since Phase 1), and thermal/fan sensors (likely to surface mostly `unsupported` per the PRD's own warning about OEM fragmentation, but worth trying with the `Reading<T>` type already built for exactly this).
+- **A second safe action**, something CPU-drain-specific (e.g. disabling a startup application) rather than only battery-mode — once it exists, `_build_suggested_action()` needs real logic for *which* action fits *which* winning hypothesis/domain, instead of always proposing the same one regardless.
 
-The NVML path still specifically needs verification on real NVIDIA hardware before it's trustworthy — everything checkable without that hardware (dynamic-loading fallback, vendor dispatch, WMI-based inventory) has been.
-
-The loop from diagnosis to action is now real (Phase 6) — `diagnose-battery` offers a concrete `sysintel act` invocation with an interactive approval prompt, `--auto-approve`, or a printed equivalent command on decline — but it's deliberately narrow: only one action exists, so it's suggested for every anomaly regardless of which hypothesis wins, rather than each hypothesis mapping to its own tailored fix. Once a second action exists (see below), `_build_suggested_action()` will need real logic for *which* action fits *which* winning hypothesis, instead of always proposing the same one.
-
-The natural next action to add is something CPU-drain-specific (e.g. disabling a startup application) rather than only battery-mode, gated behind the same broker; `best_performance`'s GUID mapping also still wants a live cross-check the way `best_power_efficiency` already got, and the NVML path still specifically needs verification on real NVIDIA hardware before it's trustworthy — everything checkable without that hardware (dynamic-loading fallback, vendor dispatch, WMI-based inventory) has been.
-
-Also worth flagging again: hypothesis-selection confidence is LLM-set, a conscious departure from the tech design's "don't let the LLM invent confidence" principle (§32) that still holds for every deterministic part of this system (the anomaly detector's threshold math, and now the action-suggestion logic, are both plain code). Verified reasonable in testing (75%/30% across the two tested branches); a rubric-based confidence *ceiling* remains the fallback plan if that trust turns out to be misplaced on harder cases later.
-
-Also still deliberately deferred: AMD/Intel GPU providers (currently always `unsupported`), true ETW-based event tracking (current events are polling-diffed, which misses anything that starts and exits between ~1s ticks), retention/rollup (collapse raw samples older than 24h into 1-minute aggregates, per the tech design), and the eventual named-pipe IPC to replace subprocess+JSON — none needed until their absence actually starts costing something.
+Still separately outstanding: the NVML path needs verification on real NVIDIA hardware (everything checkable without it has been); `best_performance`'s GUID mapping wants the same live cross-check `best_power_efficiency` already got; hypothesis-selection confidence is LLM-set (a conscious, documented departure from the tech design's §32 "don't let the LLM invent confidence" principle, which still holds for every deterministic part of this system); and AMD/Intel GPU providers, true ETW-based event tracking, retention/rollup, and the eventual named-pipe IPC all remain deliberately deferred until their absence actually starts costing something.

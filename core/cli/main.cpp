@@ -7,6 +7,7 @@
 #include <sstream>
 #include <string>
 
+#include "../anomalies/anomaly_detector.hpp"
 #include "../anomalies/battery_detector.hpp"
 #include "../collectors/battery.hpp"
 #include "../collectors/cpu.hpp"
@@ -592,6 +593,101 @@ int run_check_battery(const std::string& db_path, int min_history_days, bool as_
     return 0;
 }
 
+const char* anomaly_result_name(AnomalyCheckResult result) {
+    switch (result) {
+        case AnomalyCheckResult::kNotEnoughHistory:
+            return "not_enough_history";
+        case AnomalyCheckResult::kNoRecentSamples:
+            return "no_recent_samples";
+        case AnomalyCheckResult::kNormal:
+            return "normal";
+        case AnomalyCheckResult::kAnomalyOpened:
+            return "anomaly_opened";
+        case AnomalyCheckResult::kAnomalyOngoing:
+            return "anomaly_ongoing";
+        case AnomalyCheckResult::kResolved:
+            return "resolved";
+    }
+    return "unknown";
+}
+
+void print_generic_check_report(const std::string& label, const std::string& unit,
+                                 const AnomalyCheckReport& report) {
+    switch (report.result) {
+        case AnomalyCheckResult::kNotEnoughHistory:
+            std::cout << "Not enough history yet to evaluate " << label << " anomalies.\n";
+            break;
+        case AnomalyCheckResult::kNoRecentSamples:
+            std::cout << "No recent " << label << " samples -- skipping check.\n";
+            break;
+        case AnomalyCheckResult::kNormal:
+            std::cout << label << " normal. Baseline " << std::fixed << std::setprecision(1)
+                       << report.baseline_mean << unit << " (+/-" << report.baseline_stddev << unit
+                       << ")\n";
+            break;
+        case AnomalyCheckResult::kAnomalyOpened:
+            std::cout << "ANOMALY DETECTED (" << label << "): " << report.incident->id << "\n"
+                       << "  Observed  " << std::fixed << std::setprecision(1) << report.live_mean
+                       << unit << "\n"
+                       << "  Baseline  " << report.baseline_mean << unit << "\n"
+                       << "  Threshold " << report.threshold << unit << "\n";
+            break;
+        case AnomalyCheckResult::kAnomalyOngoing:
+            std::cout << "Anomaly ongoing (" << label << "): " << report.incident->id << " -- "
+                       << std::fixed << std::setprecision(1) << report.live_mean << unit << "\n";
+            break;
+        case AnomalyCheckResult::kResolved:
+            std::cout << "Resolved (" << label << "): " << report.incident->id << " -- back to "
+                       << std::fixed << std::setprecision(1) << report.live_mean << unit << "\n";
+            break;
+    }
+}
+
+std::string json_generic_check_report(const AnomalyCheckReport& report) {
+    std::ostringstream out;
+    out << "{\"result\":\"" << anomaly_result_name(report.result) << "\""
+        << ",\"live_mean\":" << json_num(report.live_mean)
+        << ",\"baseline_mean\":" << json_num(report.baseline_mean)
+        << ",\"baseline_stddev\":" << json_num(report.baseline_stddev)
+        << ",\"threshold\":" << json_num(report.threshold) << ",\"incident\":";
+
+    if (report.incident.has_value()) {
+        const Incident& inc = *report.incident;
+        out << "{\"id\":\"" << json_escape(inc.id) << "\",\"domain\":\"" << json_escape(inc.domain)
+            << "\",\"status\":\"" << json_escape(inc.status) << "\",\"severity\":\""
+            << json_escape(inc.severity) << "\",\"started_at_ms\":" << inc.started_at_ms
+            << ",\"resolved_at_ms\":" << inc.resolved_at_ms << ",\"trigger_type\":\""
+            << json_escape(inc.trigger_type)
+            << "\",\"observed_value\":" << json_num(inc.observed_value)
+            << ",\"baseline_mean\":" << json_num(inc.baseline_mean) << "}";
+    } else {
+        out << "null";
+    }
+
+    out << "}";
+    return out.str();
+}
+
+int run_check_generic(const std::string& db_path, const std::string& metric,
+                       const std::string& domain, const std::string& label,
+                       const std::string& unit, int min_history_days, bool as_json) {
+    SqliteStore store(db_path);
+    AnomalyDetectorConfig config;
+    config.metric = metric;
+    config.domain = domain;
+    config.min_history_days = min_history_days;
+
+    AnomalyDetector detector(store, config);
+    AnomalyCheckReport report = detector.check();
+
+    if (as_json) {
+        std::cout << json_generic_check_report(report) << std::endl;
+    } else {
+        print_generic_check_report(label, unit, report);
+    }
+    return 0;
+}
+
 int run_watch(const std::string& db_path, int min_history_days) {
     std::cout << "Watching battery/CPU/memory (recording + anomaly checks) -- Ctrl+C to stop\n";
     std::cout << "Anomaly baseline requires " << min_history_days
@@ -602,13 +698,29 @@ int run_watch(const std::string& db_path, int min_history_days) {
     g_sampler = &sampler;
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
-    BatteryAnomalyConfig config;
-    config.min_history_days = min_history_days;
-    BatteryAnomalyDetector detector(store, config);
+    BatteryAnomalyConfig battery_config;
+    battery_config.min_history_days = min_history_days;
+    BatteryAnomalyDetector battery_detector(store, battery_config);
 
-    sampler.set_periodic_hook(std::chrono::seconds(60), [&detector]() {
+    AnomalyDetectorConfig memory_config;
+    memory_config.metric = "memory.load_percent";
+    memory_config.domain = "memory";
+    memory_config.min_history_days = min_history_days;
+    AnomalyDetector memory_detector(store, memory_config);
+
+    AnomalyDetectorConfig cpu_config;
+    cpu_config.metric = "cpu.utilization";
+    cpu_config.domain = "cpu";
+    cpu_config.min_history_days = min_history_days;
+    AnomalyDetector cpu_detector(store, cpu_config);
+
+    sampler.set_periodic_hook(std::chrono::seconds(60), [&]() {
         std::cout << "[watch] ";
-        print_check_report(detector.check());
+        print_check_report(battery_detector.check());
+        std::cout << "[watch] ";
+        print_generic_check_report("memory", "%", memory_detector.check());
+        std::cout << "[watch] ";
+        print_generic_check_report("cpu", "%", cpu_detector.check());
     });
 
     sampler.run();
@@ -629,7 +741,9 @@ void print_usage() {
                   "[--reason <text>] [--db <path>] [--yes]\n"
                << "  sysintel act rollback <action-id> [--db <path>] [--yes]\n"
                << "  sysintel actions [--last <n>] [--db <path>]\n"
-               << "  sysintel check-battery [--db <path>] [--min-history-days <n>] [--json]\n";
+               << "  sysintel check-battery [--db <path>] [--min-history-days <n>] [--json]\n"
+               << "  sysintel check-memory [--db <path>] [--min-history-days <n>] [--json]\n"
+               << "  sysintel check-cpu [--db <path>] [--min-history-days <n>] [--json]\n";
 }
 
 }  // namespace
@@ -802,6 +916,28 @@ int main(int argc, char** argv) {
         }
         return command == "watch" ? run_watch(db_path, min_history_days)
                                    : run_check_battery(db_path, min_history_days, as_json);
+    }
+
+    if (command == "check-memory" || command == "check-cpu") {
+        std::string db_path = "sysintel.db";
+        int min_history_days = 14;
+        bool as_json = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--db" && i + 1 < argc) {
+                db_path = argv[++i];
+            } else if (arg == "--min-history-days" && i + 1 < argc) {
+                min_history_days = std::stoi(argv[++i]);
+            } else if (arg == "--json") {
+                as_json = true;
+            }
+        }
+        if (command == "check-memory") {
+            return run_check_generic(db_path, "memory.load_percent", "memory", "memory", "%",
+                                      min_history_days, as_json);
+        }
+        return run_check_generic(db_path, "cpu.utilization", "cpu", "cpu", "%", min_history_days,
+                                  as_json);
     }
 
     std::cerr << "unknown command: " << command << "\n";
