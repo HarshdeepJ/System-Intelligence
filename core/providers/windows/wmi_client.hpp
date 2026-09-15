@@ -15,7 +15,10 @@ using WmiRow = std::map<std::string, std::string>;
 // WQL string and gets back plain strings.
 class WmiClient {
 public:
-    WmiClient();
+    // Defaults to ROOT\CIMV2, where most inventory/GPU classes live.
+    // Thermal zones live in ROOT\WMI instead (see core/collectors/thermal.cpp),
+    // hence the parameter.
+    explicit WmiClient(const std::string& wmi_namespace = "ROOT\\CIMV2");
     ~WmiClient();
 
     WmiClient(const WmiClient&) = delete;

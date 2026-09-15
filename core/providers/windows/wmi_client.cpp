@@ -39,7 +39,7 @@ std::string variant_to_string(const VARIANT& var) {
 
 }  // namespace
 
-WmiClient::WmiClient() {
+WmiClient::WmiClient(const std::string& wmi_namespace) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     // RPC_E_CHANGED_MODE means this thread already initialized COM with a
     // different concurrency model -- fine, we simply don't own uninit'ing it.
@@ -58,9 +58,10 @@ WmiClient::WmiClient() {
         return;
     }
 
+    std::wstring wide_namespace(wmi_namespace.begin(), wmi_namespace.end());
     IWbemServices* services = nullptr;
-    hr = locator->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), nullptr, nullptr, nullptr, 0, nullptr,
-                                 nullptr, &services);
+    hr = locator->ConnectServer(_bstr_t(wide_namespace.c_str()), nullptr, nullptr, nullptr, 0,
+                                 nullptr, nullptr, &services);
     if (FAILED(hr)) {
         locator->Release();
         return;

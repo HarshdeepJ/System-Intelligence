@@ -20,6 +20,9 @@ add_executable(sysintel
     core/collectors/gpu.cpp
     core/actions/power_scheme.cpp
     core/actions/action_broker.cpp
+    core/collectors/network.cpp
+    core/collectors/disk_io.cpp
+    core/collectors/thermal.cpp
     core/cli/main.cpp
     third_party/sqlite/sqlite3.c
 )

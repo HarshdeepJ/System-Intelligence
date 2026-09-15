@@ -22,12 +22,50 @@ This repo now spans two runtimes:
 - `sysintel act rollback <action-id> [--yes]` — undoes a previous action, restoring its exact prior state
 - `sysintel actions [--last n]` — the action audit log
 - `sysintel power-schemes` — debug view of every power scheme/overlay Windows reports on this machine
+- `sysintel network` — live per-adapter throughput, link speed, and (Wi-Fi) signal quality (Phase 8)
+- `sysintel disk` — live per-disk read/write throughput, IOPS, and queue length (Phase 8)
+- `sysintel top-cpu` — top processes by CPU usage, filling the one gap `status`'s memory-sorted list left since Phase 1 (Phase 8)
+- `sysintel thermal` — CPU thermal zone temperature and fan RPM, best-effort (Phase 8)
 - every command above also takes `--json` for machine-readable output
 
 **A Python reasoning agent** (`intelligence/`, Phase 4 — real LLM reasoning via Groq, Phase 6 closes the loop into an actual action):
 - `diagnose-battery [--auto-approve] [--no-act]` — investigates an open battery incident: collects evidence via the CLI's `--json` output, sends it to an LLM for hypothesis selection, prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format, and — unless `--no-act` — offers a concrete, runnable action with an interactive approval prompt (or applies it automatically with `--auto-approve`)
 
-Everything else (the native UI, AMD/Intel GPU telemetry, network/disk-I/O collectors, and the Python agent generalizing beyond battery) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+Everything else (the native UI, AMD/Intel GPU telemetry, and the Python agent generalizing beyond battery) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+
+### Phase 8: the missing collectors — network, disk I/O, per-process CPU, thermal/fan
+
+Confirmed direction: every hardware domain, not just battery — this phase fills the collector gaps Phase 7's "what's next" named explicitly. Each one is a live-state collector (no history storage yet, matching how GPU state already works) and hit a real, worth-recording problem along the way:
+
+- **Network** (`core/collectors/network.cpp`, via the IP Helper API's `GetIfTable2`) — the first unfiltered pass reported **~25 "adapters"** for what is really one physical Wi-Fi card, because Windows creates a shadow row per internal NDIS filter driver (WFP filters, QoS packet scheduler bindings, Wi-Fi Direct virtual adapters) sharing the same interface *type* as the real adapter. Fixed by filtering on the `HardwareInterface` flag Windows exposes specifically for this, which brought it down to exactly the one real card, with genuine throughput (~3.8 KB/s) and Wi-Fi signal (87%). Separately, `iphlpapi.h`'s `MIB_IF_TABLE2`/`GetIfTable2` silently failed to declare at all until `ws2def.h`/`ws2ipdef.h` were included ahead of `windows.h` — the header's own doc comment says this, but only after empirically bisecting a `C2065: undeclared identifier` wall of errors down to a minimal isolated repro was it clear winsock2.h alone wasn't sufficient.
+- **Disk I/O** (`core/collectors/disk_io.cpp`, via PDH's `\PhysicalDisk(*)` wildcard counters) — read/write throughput, IOPS, and queue length per physical disk, reusing the exact two-sample-rate trick the CPU collector already proved in Phase 1. Static disk *inventory* (model/size) already existed since Phase 3.5; this is the live-activity half of that domain.
+- **Per-process CPU** (`core/collectors/process.cpp`, via PDH's `\Process(*)\% Processor Time` + `\Process(*)\ID Process`) — a gap flagged honestly since Phase 1 ("sorts by memory, not CPU"), closed the same way total CPU already worked, just per-instance. One caveat worth stating rather than hiding: matching the two counters' instances by *name* is approximate, and a real run showed two distinct "Code" instances both resolving to the same PID — a known PDH quirk (instance enumeration order isn't guaranteed to line up perfectly between two separately-queried counters), not something this implementation tries to paper over.
+- **Thermal/fan** (`core/collectors/thermal.cpp`) — tried both real mechanisms (`MSAcpi_ThermalZoneTemperature` in the `ROOT\WMI` namespace for CPU temperature, `Win32_Fan` in `ROOT\CIMV2` for RPM), required extending `WmiClient` to accept a namespace parameter (it only ever talked to `ROOT\CIMV2` before). Result on this machine: thermal zone `unsupported` (the class/namespace itself isn't queryable here), fan `unavailable` (the `Win32_Fan` instance exists, but its `DesiredSpeed` field is empty) — exactly what the PRD's own warning about OEM fragmentation predicted, and exactly the distinction `Reading<T>` exists to preserve rather than collapsing both into a meaningless `0`.
+
+```text
+$ sysintel network
+Network adapters (physical only)
+  Intel(R) Wi-Fi 6E AX211 160MHz  [wifi] up
+    Link speed      1201 Mbps
+    Up / Down       0.36 / 0.39 KB/s
+    Wi-Fi signal    87%
+
+$ sysintel disk
+  0 C: D:
+    Read            97199.4 B/s
+    Write           481947 B/s
+    Reads/sec       1.98
+    Writes/sec      36.58
+    Queue length    0
+
+$ sysintel thermal
+Thermal zones
+  cpu  unsupported
+Fans
+  Cooling Device  unavailable
+```
+
+Not yet done: none of these four feed into history/anomaly detection yet (only live state, like GPU), and the Python diagnostic agent still can't see any of them. That, plus generalizing diagnosis itself beyond battery, remains the next slice.
 
 ### Phase 7: one detector, three domains — the start of "diagnose everything"
 
@@ -481,7 +519,7 @@ Three steps:
 2. For each one, ask how much memory it's using via `GetProcessMemoryInfo` (some processes refuse this — those get skipped, that's fine).
 3. Sort biggest-to-smallest and keep the top 8.
 
-Known simplification: this sorts by **memory**, not CPU. Per-process CPU needs the same "measure twice, one second apart" trick as the CPU collector above, just done individually for every process — left for a follow-up rather than built into this first pass.
+`get_top_processes_by_memory()` sorts by **memory**; `get_top_processes_by_cpu()` (Phase 8) closes the gap this file honestly flagged since Phase 1, via PDH's `\Process(*)\% Processor Time` + `\Process(*)\ID Process` wildcard counters (two-sample rate, same trick as the total CPU collector), matching the same instance name to a PID across both. Worth stating plainly: that name-based matching is approximate — a real run showed two distinct "Code" instances both resolving to PID 3736, a known PDH quirk (instance array order isn't guaranteed to line up identically between two separately-queried counters). Not something this code tries to paper over with false precision.
 
 It also exposes `get_all_process_identities()` — every PID+name with *no* memory query, cheap enough to call every ~1 second purely so the event detector below can diff it against the last tick.
 
@@ -494,6 +532,8 @@ The "things that don't change often" pillar — CPU/GPU/disk model, OS version, 
 ### [`core/providers/windows/wmi_client.hpp`](core/providers/windows/wmi_client.hpp) / [`wmi_client.cpp`](core/providers/windows/wmi_client.cpp)
 A small reusable wrapper around WMI's COM API (`IWbemLocator`, `IWbemServices`, SAFEARRAYs of property names, VARIANTs...) so every inventory field doesn't have to repeat that boilerplate. Give it a WQL string, get back plain string-keyed rows. If WMI itself is unreachable (e.g. the service is disabled), `ok()` is false and every query just returns empty rather than crashing — callers treat that the same way they treat a missing field.
 
+The constructor takes an optional WMI namespace, defaulting to `ROOT\CIMV2` where every class this project queried through Phase 7 lived. Phase 8's thermal collector needed `ROOT\WMI` instead (where ACPI thermal zones live), which is what the parameter is for — added only once a second real namespace was actually needed, not speculatively.
+
 ### [`core/model/gpu_state.hpp`](core/model/gpu_state.hpp) / [`core/collectors/gpu.cpp`](core/collectors/gpu.cpp)
 The vendor-dispatch pattern: detect each GPU's vendor via WMI (same source the inventory uses), then hand NVIDIA adapters to the NVML provider and mark AMD/Intel adapters `unsupported` (no provider built for either yet). If WMI says there's an NVIDIA GPU but NVML couldn't be loaded, that's reported as `unavailable`, not `unsupported` — the hardware path exists, the telemetry provider just isn't reachable right now. This distinction is only meaningful because of the availability type above.
 
@@ -501,6 +541,17 @@ The vendor-dispatch pattern: detect each GPU's vendor via WMI (same source the i
 GPU utilization/VRAM/temperature/power/performance-state for NVIDIA GPUs, via NVIDIA's NVML. Rather than linking a static import lib (which requires the CUDA Toolkit as a build dependency — not something an end user's machine would have), this hand-declares the small stable subset of NVML's C ABI it needs and loads `nvml.dll` dynamically with `LoadLibrary`/`GetProcAddress` at runtime. That's also exactly why the project still compiles and runs cleanly here: this dev machine has only an Intel iGPU, `nvml.dll` doesn't exist on it, `LoadLibraryA` returns null, and every GPU reading correctly falls back to `unavailable`/`unsupported` instead of failing to build.
 
 **Caveat, stated plainly:** this was written without access to NVIDIA hardware. The dynamic-loading mechanism and struct layouts follow NVIDIA's publicly documented, stable NVML ABI, and the negative path (no `nvml.dll` present) is verified working — but the actual "read real GPU telemetry" path has not been exercised against a real device or driver. Verify on NVIDIA hardware before relying on it.
+
+### [`core/model/network_state.hpp`](core/model/network_state.hpp) / [`core/collectors/network.cpp`](core/collectors/network.cpp)
+Per-adapter throughput (via a two-sample rate over ~1 second, same trick as `cpu.cpp`), link speed, and Wi-Fi signal quality, via the IP Helper API (`GetIfTable2`) and, for signal quality, the WLAN API. Filters to `InterfaceAndOperStatusFlags.HardwareInterface && !FilterInterface` — without that filter, this reported ~25 rows for one physical card, since Windows creates a shadow `MIB_IF_ROW2` entry per internal NDIS filter driver bound to the same adapter, sharing its interface type. Wi-Fi signal quality is best-effort: the WLAN API reports on whichever interface is currently *connected*, not addressable per-adapter by the same LUID the throughput counters use, so it's not matched with the same precision.
+
+Needed an unusual include order to compile at all: `ws2def.h`/`ws2ipdef.h` explicitly, before `windows.h` — `iphlpapi.h`'s own doc comment says `netioapi.h` (where `MIB_IF_TABLE2`/`GetIfTable2` actually live) expects those headers already included, and `winsock2.h` alone wasn't sufficient in practice. Found by bisecting with an isolated minimal repro after the real collector file produced a wall of `undeclared identifier` errors.
+
+### [`core/model/disk_io_state.hpp`](core/model/disk_io_state.hpp) / [`core/collectors/disk_io.cpp`](core/collectors/disk_io.cpp)
+Live per-disk read/write throughput, IOPS, and queue length via PDH's `\PhysicalDisk(*)` wildcard counters — the same array-reading pattern as the per-process CPU collector below, and the same two-sample-rate trick the total CPU collector introduced in Phase 1. Complements `core/inventory/system_inventory.cpp`'s static disk model/size, which only ever answers "what disk is this," never "what is it doing right now."
+
+### [`core/model/thermal_state.hpp`](core/model/thermal_state.hpp) / [`core/collectors/thermal.cpp`](core/collectors/thermal.cpp)
+CPU thermal zone temperature (`MSAcpi_ThermalZoneTemperature`, in the `ROOT\WMI` namespace — not `ROOT\CIMV2` where every other WMI query in this project lives, which is why `WmiClient` gained a namespace constructor parameter) and fan RPM (`Win32_Fan`, back in `ROOT\CIMV2`). On this machine: thermal zones report `unsupported` (the class isn't queryable at all here) and the one `Win32_Fan` instance that does exist reports `unavailable` for its speed (the field is simply empty) — exactly the PRD's own prediction about OEM-fragmented thermal telemetry, now something this codebase can state precisely instead of guessing at.
 
 ### [`core/model/system_event.hpp`](core/model/system_event.hpp) / [`core/events/event_detector.hpp`](core/events/event_detector.hpp) / [`event_detector.cpp`](core/events/event_detector.cpp)
 The "what changed" pillar — without needing ETW yet. `SystemEventDetector` keeps the previous tick's full PID set and AC-power state; each call diffs the new snapshot against it and returns `process.started`/`process.stopped`/`power.ac_connected`/`power.ac_disconnected` events for whatever changed. True ETW-based tracking (lower latency, catches processes that start and exit *between* poll ticks) is a real upgrade for later, not needed to get real event data today — verified by launching and closing Notepad mid-recording and seeing both events land in SQLite.
@@ -621,10 +672,10 @@ Template for `intelligence/.env` (gitignored, never committed): `GROQ_API_KEY` a
 
 ### [`CMakeLists.txt`](CMakeLists.txt)
 The build recipe. Tells the compiler:
-- which `.cpp` files to compile (collectors, storage, sampler, anomaly detector, inventory, events, GPU dispatch, WMI/NVML providers, power scheme + action broker, CLI) plus `sqlite3.c` as a C file,
+- which `.cpp` files to compile (collectors, storage, sampler, anomaly detector, inventory, events, GPU dispatch, WMI/NVML providers, power scheme + action broker, network/disk/thermal collectors, CLI) plus `sqlite3.c` as a C file,
 - to use C++20 for our own code,
 - where to find `sqlite3.h` (`third_party/sqlite`),
-- and to link against `pdh`, `powrprof`, `psapi`, `wbemuuid` (the last for WMI's COM API) — Windows' own pre-built libraries containing the real implementations of the functions we called. Without naming these, the compiler wouldn't know where those functions actually live. NVML needs no new link library at all, since it's loaded dynamically at runtime with `LoadLibrary` rather than linked at build time.
+- and to link against `pdh`, `powrprof`, `psapi`, `wbemuuid` (the last for WMI's COM API) — Windows' own pre-built libraries containing the real implementations of the functions we called. Without naming these, the compiler wouldn't know where those functions actually live. NVML needs no new link library at all, since it's loaded dynamically at runtime with `LoadLibrary` rather than linked at build time. Phase 8's network collector links `iphlpapi`/`wlanapi` a third way — via `#pragma comment(lib, ...)` directly in `network.cpp` — so those two don't appear here at all; either mechanism works, this file just doesn't need to know about every one a given source file chooses.
 
 ## Building and running it
 
@@ -672,10 +723,10 @@ No key configured, or the API call fails for any reason? The agent automatically
 
 ## What's next
 
-The stated direction now is comprehensive coverage: "all the information, diagnose everything," not just battery. Phase 7 generalized *detection* to three domains; what it deliberately didn't touch:
+The stated direction is comprehensive coverage: "all the information, diagnose everything," not just battery. Phase 7 generalized *detection* to three domains; Phase 8 filled the missing collectors. What's still not touched:
 
-- **The Python agent still only diagnoses battery incidents.** `check-memory`/`check-cpu` will happily open incidents, but nothing investigates *why* yet — `BatteryDiagnosticAgent` needs to become domain-aware (or a `MemoryDiagnosticAgent`/`CpuDiagnosticAgent` need to exist alongside it), with per-domain hypothesis sets. This is the natural next slice.
-- **New collectors**, still needed for real domain coverage: network (a whole original MVP domain with zero coverage so far), disk I/O throughput/IOPS (currently only static disk *inventory* exists, no live activity), per-process CPU attribution (a known gap since Phase 1), and thermal/fan sensors (likely to surface mostly `unsupported` per the PRD's own warning about OEM fragmentation, but worth trying with the `Reading<T>` type already built for exactly this).
+- **None of the four new collectors (network, disk I/O, per-process CPU, thermal/fan) feed history or anomaly detection yet.** They're live-state only, the same place GPU state was left in Phase 3.5 — `sysintel network`/`disk`/`top-cpu`/`thermal` show you what's happening right now, but nothing is recorded to SQLite or checked against a baseline. Wiring network/disk throughput into the sampler (aggregate across adapters/disks, matching how GPU could eventually get the same treatment) is the natural extension once there's a reason to alarm on them.
+- **The Python agent still only diagnoses battery incidents.** `check-memory`/`check-cpu` will happily open incidents, but nothing investigates *why* yet, and now there's real per-domain evidence (network throughput, disk I/O, per-process CPU, thermal state) that a generalized agent could actually reason over. `BatteryDiagnosticAgent` needs to become domain-aware (or per-domain agents need to exist alongside it), with per-domain hypothesis sets. This is the natural next slice, and arguably the most valuable one now that there's real data behind every domain.
 - **A second safe action**, something CPU-drain-specific (e.g. disabling a startup application) rather than only battery-mode — once it exists, `_build_suggested_action()` needs real logic for *which* action fits *which* winning hypothesis/domain, instead of always proposing the same one regardless.
 
 Still separately outstanding: the NVML path needs verification on real NVIDIA hardware (everything checkable without it has been); `best_performance`'s GUID mapping wants the same live cross-check `best_power_efficiency` already got; hypothesis-selection confidence is LLM-set (a conscious, documented departure from the tech design's §32 "don't let the LLM invent confidence" principle, which still holds for every deterministic part of this system); and AMD/Intel GPU providers, true ETW-based event tracking, retention/rollup, and the eventual named-pipe IPC all remain deliberately deferred until their absence actually starts costing something.

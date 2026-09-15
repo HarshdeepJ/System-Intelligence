@@ -16,6 +16,9 @@
 #include "../actions/action_broker.hpp"
 #include "../actions/power_scheme.hpp"
 #include "../model/gpu_state.hpp"
+#include "../model/disk_io_state.hpp"
+#include "../model/thermal_state.hpp"
+#include "../model/network_state.hpp"
 #include "../model/system_inventory.hpp"
 #include "../sampler/sampler.hpp"
 #include "../storage/sqlite_store.hpp"
@@ -123,6 +126,100 @@ void print_reading(const std::string& label, const Reading<T>& r) {
 }
 
 void print_event(const SystemEvent& event);  // defined further below, used here for --db output
+
+int run_network() {
+    std::cout << "(sampling for 1 second...)\r" << std::flush;
+    auto adapters = get_network_state();
+    std::cout << "Network adapters (physical only)          \n\n";
+    if (adapters.empty()) {
+        std::cout << "  (none detected)\n";
+    }
+    for (const auto& a : adapters) {
+        std::cout << "  " << a.name << "  [" << a.type << "]"
+                   << (a.operational ? " up" : " down") << "\n";
+        if (a.link_speed_bps.value.has_value()) {
+            std::cout << "    Link speed      " << (*a.link_speed_bps.value / 1000000.0)
+                       << " Mbps\n";
+        } else {
+            std::cout << "    Link speed      " << availability_name(a.link_speed_bps.availability)
+                       << "\n";
+        }
+        if (a.bytes_sent_per_sec.value.has_value() && a.bytes_received_per_sec.value.has_value()) {
+            std::cout << "    Up / Down       " << (*a.bytes_sent_per_sec.value / 1024.0) << " / "
+                       << (*a.bytes_received_per_sec.value / 1024.0) << " KB/s\n";
+        } else {
+            std::cout << "    Up / Down       "
+                       << availability_name(a.bytes_sent_per_sec.availability) << "\n";
+        }
+        if (a.wifi_signal_percent.value.has_value()) {
+            std::cout << "    Wi-Fi signal    " << *a.wifi_signal_percent.value << "%\n";
+        } else {
+            std::cout << "    Wi-Fi signal    "
+                       << availability_name(a.wifi_signal_percent.availability) << "\n";
+        }
+    }
+    return 0;
+}
+
+int run_thermal() {
+    auto state = get_thermal_and_fan_state();
+    std::cout << "Thermal zones\n";
+    for (const auto& z : state.thermal_zones) {
+        std::cout << "  " << z.name << "  ";
+        if (z.temperature_celsius.value.has_value()) {
+            std::cout << *z.temperature_celsius.value << " C\n";
+        } else {
+            std::cout << availability_name(z.temperature_celsius.availability) << "\n";
+        }
+    }
+    std::cout << "\nFans\n";
+    for (const auto& f : state.fans) {
+        std::cout << "  " << f.name << "  ";
+        if (f.rpm.value.has_value()) {
+            std::cout << *f.rpm.value << " RPM\n";
+        } else {
+            std::cout << availability_name(f.rpm.availability) << "\n";
+        }
+    }
+    return 0;
+}
+
+int run_top_cpu() {
+    std::cout << "(sampling for 1 second...)\r" << std::flush;
+    auto processes = get_top_processes_by_cpu(8);
+    std::cout << "Top processes by CPU              \n\n";
+    for (const auto& p : processes) {
+        std::cout << "  " << std::left << std::setw(20) << p.name << std::right << std::fixed
+                   << std::setprecision(1) << p.cpu_percent << "%  (pid " << p.pid << ")\n";
+    }
+    return 0;
+}
+
+int run_disk() {
+    std::cout << "(sampling for 1 second...)\r" << std::flush;
+    auto disks = get_disk_io_state();
+    std::cout << "Disk I/O (live)                     \n\n";
+    if (disks.empty()) {
+        std::cout << "  (none detected)\n";
+    }
+    for (const auto& d : disks) {
+        std::cout << "  " << d.instance << "\n";
+        auto print_field = [](const char* label, const Reading<double>& r, const char* unit) {
+            std::cout << "    " << label;
+            if (r.value.has_value()) {
+                std::cout << *r.value << " " << unit << "\n";
+            } else {
+                std::cout << availability_name(r.availability) << "\n";
+            }
+        };
+        print_field("Read            ", d.read_bytes_per_sec, "B/s");
+        print_field("Write           ", d.write_bytes_per_sec, "B/s");
+        print_field("Reads/sec       ", d.reads_per_sec, "");
+        print_field("Writes/sec      ", d.writes_per_sec, "");
+        print_field("Queue length    ", d.queue_length, "");
+    }
+    return 0;
+}
 
 int run_power_schemes() {
     auto schemes = enumerate_power_schemes();
@@ -754,6 +851,22 @@ int main(int argc, char** argv) {
     if (command == "status") {
         bool as_json = argc > 2 && std::string(argv[2]) == "--json";
         return as_json ? run_status_json() : run_status();
+    }
+
+    if (command == "network") {
+        return run_network();
+    }
+
+    if (command == "disk") {
+        return run_disk();
+    }
+
+    if (command == "top-cpu") {
+        return run_top_cpu();
+    }
+
+    if (command == "thermal") {
+        return run_thermal();
     }
 
     if (command == "power-schemes") {
