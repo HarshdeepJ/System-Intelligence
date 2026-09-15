@@ -1,5 +1,7 @@
 #pragma once
 #include <atomic>
+#include <chrono>
+#include <functional>
 
 #include "../storage/sqlite_store.hpp"
 
@@ -17,6 +19,12 @@ class Sampler {
 public:
     explicit Sampler(SqliteStore& store);
 
+    // Runs `hook` roughly every `interval` while the loop is running (checked
+    // each tick, same as the per-metric intervals). Keeps Sampler ignorant of
+    // *why* a caller wants a periodic callback -- e.g. `watch` uses this to
+    // run anomaly checks without Sampler depending on anomaly-detection code.
+    void set_periodic_hook(std::chrono::seconds interval, std::function<void()> hook);
+
     // Blocks until request_stop() is called (e.g. from a Ctrl+C handler on
     // another thread).
     void run();
@@ -26,6 +34,9 @@ public:
 private:
     SqliteStore& store_;
     std::atomic<bool> stop_requested_{false};
+
+    std::chrono::seconds hook_interval_{0};
+    std::function<void()> hook_;
 };
 
 }  // namespace sysintel

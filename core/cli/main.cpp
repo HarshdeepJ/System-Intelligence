@@ -1,10 +1,12 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <string>
 
+#include "../anomalies/battery_detector.hpp"
 #include "../collectors/battery.hpp"
 #include "../collectors/cpu.hpp"
 #include "../collectors/memory.hpp"
@@ -119,11 +121,79 @@ int run_history(const std::string& db_path, const std::string& metric, int last_
     return 0;
 }
 
+void print_check_report(const BatteryCheckReport& report) {
+    switch (report.result) {
+        case BatteryCheckResult::kNotEnoughHistory:
+            std::cout << "Not enough history yet to evaluate battery anomalies.\n";
+            break;
+        case BatteryCheckResult::kNoRecentDischarge:
+            std::cout << "No recent discharge samples (on AC, or not run long enough) -- "
+                          "skipping check.\n";
+            break;
+        case BatteryCheckResult::kNormal:
+            std::cout << "Battery normal. Baseline " << std::fixed << std::setprecision(1)
+                       << report.baseline_mean << "W (+/-" << report.baseline_stddev << "W)\n";
+            break;
+        case BatteryCheckResult::kAnomalyOpened:
+            std::cout << "ANOMALY DETECTED: " << report.incident->id << "\n"
+                       << "  Observed  " << std::fixed << std::setprecision(1) << report.live_mean
+                       << " W\n"
+                       << "  Baseline  " << report.baseline_mean << " W\n"
+                       << "  Threshold " << report.threshold << " W\n";
+            break;
+        case BatteryCheckResult::kAnomalyOngoing:
+            std::cout << "Anomaly ongoing: " << report.incident->id << " -- " << std::fixed
+                       << std::setprecision(1) << report.live_mean << " W\n";
+            break;
+        case BatteryCheckResult::kResolved:
+            std::cout << "Resolved: " << report.incident->id << " -- back to " << std::fixed
+                       << std::setprecision(1) << report.live_mean << " W\n";
+            break;
+    }
+}
+
+int run_check_battery(const std::string& db_path, int min_history_days) {
+    SqliteStore store(db_path);
+    BatteryAnomalyConfig config;
+    config.min_history_days = min_history_days;
+    BatteryAnomalyDetector detector(store, config);
+
+    print_check_report(detector.check());
+    return 0;
+}
+
+int run_watch(const std::string& db_path, int min_history_days) {
+    std::cout << "Watching battery/CPU/memory (recording + anomaly checks) -- Ctrl+C to stop\n";
+    std::cout << "Anomaly baseline requires " << min_history_days
+               << " day(s) of accumulated history.\n\n";
+
+    SqliteStore store(db_path);
+    Sampler sampler(store);
+    g_sampler = &sampler;
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+
+    BatteryAnomalyConfig config;
+    config.min_history_days = min_history_days;
+    BatteryAnomalyDetector detector(store, config);
+
+    sampler.set_periodic_hook(std::chrono::seconds(60), [&detector]() {
+        std::cout << "[watch] ";
+        print_check_report(detector.check());
+    });
+
+    sampler.run();
+
+    std::cout << "\nStopped.\n";
+    return 0;
+}
+
 void print_usage() {
     std::cerr << "usage:\n"
                << "  sysintel status\n"
                << "  sysintel record [--db <path>]\n"
-               << "  sysintel history <metric> [--last <minutes>] [--db <path>]\n";
+               << "  sysintel watch [--db <path>] [--min-history-days <n>]\n"
+               << "  sysintel history <metric> [--last <minutes>] [--db <path>]\n"
+               << "  sysintel check-battery [--db <path>] [--min-history-days <n>]\n";
 }
 
 }  // namespace
@@ -163,6 +233,21 @@ int main(int argc, char** argv) {
             }
         }
         return run_history(db_path, metric, last_minutes);
+    }
+
+    if (command == "watch" || command == "check-battery") {
+        std::string db_path = "sysintel.db";
+        int min_history_days = 14;
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--db" && i + 1 < argc) {
+                db_path = argv[++i];
+            } else if (arg == "--min-history-days" && i + 1 < argc) {
+                min_history_days = std::stoi(argv[++i]);
+            }
+        }
+        return command == "watch" ? run_watch(db_path, min_history_days)
+                                   : run_check_battery(db_path, min_history_days);
     }
 
     std::cerr << "unknown command: " << command << "\n";

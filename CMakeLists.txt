@@ -11,6 +11,7 @@ add_executable(sysintel
     core/collectors/process.cpp
     core/storage/sqlite_store.cpp
     core/sampler/sampler.cpp
+    core/anomalies/battery_detector.cpp
     core/cli/main.cpp
     third_party/sqlite/sqlite3.c
 )
