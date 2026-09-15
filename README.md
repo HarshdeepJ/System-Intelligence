@@ -24,10 +24,46 @@ This repo now spans two runtimes:
 - `sysintel power-schemes` — debug view of every power scheme/overlay Windows reports on this machine
 - every command above also takes `--json` for machine-readable output
 
-**A Python reasoning agent** (`intelligence/`, Phase 4 — the first AI-shaped piece, though not actually calling a model yet, see below):
-- `diagnose-battery` — investigates an open battery incident: collects evidence via the CLI's `--json` output, weighs it against a small set of hypotheses, and prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format
+**A Python reasoning agent** (`intelligence/`, Phase 4 — real LLM reasoning via Groq, Phase 6 closes the loop into an actual action):
+- `diagnose-battery [--auto-approve] [--no-act]` — investigates an open battery incident: collects evidence via the CLI's `--json` output, sends it to an LLM for hypothesis selection, prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format, and — unless `--no-act` — offers a concrete, runnable action with an interactive approval prompt (or applies it automatically with `--auto-approve`)
 
 Everything else (the native UI, AMD/Intel GPU telemetry) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+
+### Phase 6: closing the loop, from diagnosis to action
+
+Phases 4 and 5 built two halves that never talked to each other: a diagnostic agent that could only print a text recommendation, and an Action Broker that could only be invoked by hand. This phase connects them — but deliberately *not* by letting the LLM decide what to execute.
+
+The design keeps the same boundary this whole project has held since Phase 4: the model only ever produces prose. `agent.py`'s `_build_suggested_action()` is a plain function, not an LLM call — it looks at whether there's an open/ongoing anomaly (nothing else) and always proposes the same fixed `change_power_mode` / `best_power_efficiency` action, regardless of which hypothesis won. That's a deliberate choice, not a limitation being papered over: Best Power Efficiency mode reduces both CPU- and GPU-adjacent power draw at the OS level, so it's a reasonable, fully-reversible thing to try even when the root cause isn't pinned down exactly — and because it's cheap to undo, it doesn't need to wait for perfect diagnostic certainty the way a riskier action would.
+
+`main.py` is the actual approval gate: it prints the suggested action and asks `Apply this now? [y/N]` before anything happens, unless `--auto-approve` was passed explicitly. Only after a yes does `tools.py`'s `apply_change_power_mode()` call through to `sysintel act change-power-mode --yes` — the exact same Action Broker path a human typing the command directly would take.
+
+Verified end-to-end on the real machine, twice: once with the interactive prompt declined (confirmed the machine's power mode was untouched, and the exact equivalent command was printed for later use), and once with `--auto-approve` after manually switching to a different mode first (confirmed the diagnosis correctly detected the mismatch, applied the real change through the broker, and independent re-reads confirmed both the change and the final restored state).
+
+```text
+$ intelligence diagnose-battery --db sysintel.db --sysintel-exe build\sysintel.exe
+[reasoned by: LLM (Groq)]
+...
+Suggested action
+  Switch Windows' battery Power Mode to 'Best power efficiency'
+
+Apply this now? [y/N]: n
+Not applied. Run it yourself later with:
+  sysintel act change-power-mode --level best_power_efficiency --reason "battery drain anomaly: 21.9W vs 8.4W baseline" --yes
+```
+
+```text
+$ intelligence diagnose-battery --db sysintel.db --sysintel-exe build\sysintel.exe --auto-approve
+[reasoned by: LLM (Groq)]
+...
+Suggested action
+  Switch Windows' battery Power Mode to 'Best power efficiency'
+  (--auto-approve given, applying without an interactive prompt)
+
+Applied: changed and verified
+  Previous state   DED574B5-45A0-4F42-8737-46345C09C238
+  New state        961CC777-2547-4F9D-8174-7D86181B8A7A
+  Action id        change_power_mode-1789475982288  (undo with: sysintel act rollback change_power_mode-1789475982288 --yes)
+```
 
 ### Phase 5: the Action Broker, and the first safe action
 
@@ -293,10 +329,10 @@ flowchart TD
 
     subgraph PYPROC["A SEPARATE PROCESS: python -m intelligence.main"]
         TOOLS["tools.py: SysIntelClient<br/>the only way the agent touches the machine"]
-        SCHEMAS["schemas.py<br/>Pydantic models incl. Reading[T], validate JSON on the way in"]
-        AGENT["agent.py: BatteryDiagnosticAgent<br/>TRIAGE -&gt; HYPOTHESES -&gt; EVIDENCE -&gt; (LLM or fallback) -&gt; EXPLAIN"]
+        SCHEMAS["schemas.py<br/>Pydantic models incl. Reading[T], ActionOutcome"]
+        AGENT["agent.py: BatteryDiagnosticAgent<br/>TRIAGE -&gt; HYPOTHESES -&gt; EVIDENCE -&gt; (LLM or fallback) -&gt; EXPLAIN<br/>+ _build_suggested_action() (plain code, not the LLM)"]
         LLM["llm.py: select_hypothesis()<br/>the ONLY thing that touches an LLM"]
-        PYMAIN["main.py<br/>diagnose-battery, prints reasoned_by"]
+        PYMAIN["main.py<br/>diagnose-battery: prints reasoned_by,<br/>asks 'Apply this now? [y/N]'"]
     end
 
     GROQ[["Groq API<br/>(external service)"]]
@@ -309,11 +345,16 @@ flowchart TD
     AGENT -->|"fixed hypothesis list + deterministically-gathered evidence only"| LLM
     LLM -->|"HTTPS, structured JSON response required"| GROQ
     LLM -.->|"LlmUnavailableError on failure"| AGENT
+
+    PYMAIN -->|"only after y/N or --auto-approve"| TOOLS
+    TOOLS ==>|"subprocess: sysintel act change-power-mode --yes<br/>(same fixed action_type/params shape as the CLI)"| AB2["core/actions/action_broker.cpp<br/>(same broker as Phase 5's diagram)"]
 ```
 
 Nothing here talks to Windows directly except the four `collectors/` files — everything else (`main.cpp`, `sampler.cpp`) just asks a collector for its snapshot. That separation is deliberate: later, the background service and the AI reasoning layer will call these exact same collector functions, and none of the collector code will need to change.
 
 Notice the `python -m intelligence.main` box is a **separate process**, connected to everything above it by exactly one edge: `tools.py` calling `sysintel.exe` as a subprocess with fixed subcommands (`status`, `history`, `check-battery`) and typed arguments — never a free-form string handed to a shell. That's the whole point of the boundary: the reasoning layer can be wrong, slow, or (eventually) an actual LLM making mistakes, and none of that can turn into an arbitrary command against the machine. The real product will eventually replace this subprocess+JSON transport with the named-pipe IPC from the tech design, but the *tools* the agent calls won't need to change — only what's underneath them.
+
+The new `PYMAIN -> TOOLS -> action_broker.cpp` edge at the bottom is Phase 6's addition, and it's worth tracing carefully: it starts at `PYMAIN`, not `AGENT` or `LLM` — the approval prompt lives in `main.py`, gating the call before `tools.py` is ever invoked for it. `AGENT` never calls `TOOLS`' action methods itself; it only *returns* a `suggested_action` value for `PYMAIN` to look at. That's what keeps the LLM's blast radius exactly where it was in Phase 4: it can influence what gets *suggested* in prose, but the actual decision to invoke the broker, and the fixed shape of what gets sent to it, never passes through the model at all.
 
 ### Phase 3.5's additions: Inventory, Events, and GPU dispatch
 
@@ -516,10 +557,10 @@ The dashboard, now with eleven modes (`status`, `history`, `check-battery`, `wat
 The `--json` output uses the hand-written helpers in `core/util/json.hpp`, not a JSON library — the object shapes here are small and fixed, so a real library would be machinery this project doesn't need yet, the same call made about not vendoring a package manager just for SQLite. This JSON is the entire contract the Python agent depends on.
 
 ### [`intelligence/schemas.py`](intelligence/schemas.py)
-Pydantic models that mirror the CLI's JSON output exactly — `BatterySnapshot`, `SystemSnapshot`, `MetricHistory`, `Incident`, `BatteryCheckReport`, `SystemEvent`/`EventsResult`, and a generic `Reading[T]` mirroring `core/model/availability.hpp`'s `Reading<T>` field-for-field (`value` + `ok`/`unsupported`/`unavailable`/`error`). `GpuState` uses `Reading[T]` for every metric, so the availability distinction survives the C++ → JSON → Python round trip intact. Pydantic validates the shape on the way in, so if the C++ side's JSON ever drifts, it fails loudly right here instead of as a confusing bug three layers into the agent's reasoning.
+Pydantic models that mirror the CLI's JSON output exactly — `BatterySnapshot`, `SystemSnapshot`, `MetricHistory`, `Incident`, `BatteryCheckReport`, `SystemEvent`/`EventsResult`, `ActionOutcome`, and a generic `Reading[T]` mirroring `core/model/availability.hpp`'s `Reading<T>` field-for-field (`value` + `ok`/`unsupported`/`unavailable`/`error`). `GpuState` uses `Reading[T]` for every metric, so the availability distinction survives the C++ → JSON → Python round trip intact. Pydantic validates the shape on the way in, so if the C++ side's JSON ever drifts, it fails loudly right here instead of as a confusing bug three layers into the agent's reasoning.
 
 ### [`intelligence/tools.py`](intelligence/tools.py)
-The agent's *only* way of touching the machine — this is literally the PRD's "Diagnostic Tool Interface." `SysIntelClient` exposes `get_system_snapshot` (now includes `gpu`), `get_metric_history`, `get_battery_anomaly_status`, and `get_recent_events` — each calling one fixed `sysintel.exe` subcommand via `subprocess.run` with a list of arguments, never a shell string. There is no method on this class that could execute an arbitrary command; the agent literally cannot construct one.
+The agent's *only* way of touching the machine — this is literally the PRD's "Diagnostic Tool Interface." `SysIntelClient` exposes `get_system_snapshot` (now includes `gpu`), `get_metric_history`, `get_battery_anomaly_status`, `get_recent_events`, and — new this phase — `apply_change_power_mode()`/`rollback_action()`, each calling one fixed `sysintel.exe` subcommand via `subprocess.run` with a list of arguments, never a shell string. There is no method on this class that could execute an arbitrary command; the agent literally cannot construct one. `apply_change_power_mode()` defaults `approved=True` deliberately: by the time anything calls it, a human has already said yes (interactively in `main.py`, or via `--auto-approve`) — the real approval gate lives one layer up, not here.
 
 ### [`intelligence/llm.py`](intelligence/llm.py)
 The entire LLM boundary, and nothing more than that. `select_hypothesis()` takes the fixed hypothesis list and whatever evidence `agent.py` already gathered deterministically, and asks Groq to (a) pick a winner from the *given* IDs — never invent a new one — and (b) write the confidence/finding/recommendation. The model has no tools and never touches the machine; every fact it reasons over was collected by plain function calls before it was ever consulted. Output is constrained to JSON validated against `LlmDiagnosisResult`, so a malformed or off-script response raises `LlmUnavailableError` instead of silently corrupting what gets printed. Reads `GROQ_API_KEY`/`GROQ_MODEL` from `intelligence/.env` (via `python-dotenv`), which is gitignored — the repo only ships `.env.example` as a template.
@@ -536,8 +577,12 @@ The reasoning loop: TRIAGE → GENERATE HYPOTHESES → COLLECT EVIDENCE → EVAL
 
 Every `Diagnosis` carries a `reasoned_by` field (`"llm"` or `"rule-based"`), and `main.py` always prints which one actually ran — never letting a degraded response masquerade as a full one.
 
+**Phase 6 addition:** `_build_suggested_action(check)` is a plain function, not an LLM call — given an open/ongoing anomaly, it always proposes the same `change_power_mode`/`best_power_efficiency` action, wrapped in a `SuggestedAction` (`action_type`, `params`, `reason`, `description`) and attached to every `Diagnosis` regardless of which path produced it (LLM or fallback) or which hypothesis won. The LLM's `recommended_action` text and this `suggested_action` value are two separate things: one is prose the model wrote, the other is a fixed, code-computed action_type/params pair the Action Broker already recognizes. Only the second one can ever actually execute.
+
 ### [`intelligence/main.py`](intelligence/main.py)
-The Python entry point — `python -m intelligence.main diagnose-battery [--db path] [--sysintel-exe path] [--min-history-days n]`. Wires a `SysIntelClient` to a `BatteryDiagnosticAgent`, prints which reasoning path ran, then the diagnosis. Also reconfigures stdout to UTF-8 on the way in — Windows' console defaults to a legacy codepage that can't encode a lot of ordinary Unicode punctuation an LLM will happily produce (hit this for real: a narrow no-break space in one response crashed the print before this fix).
+The Python entry point — `python -m intelligence.main diagnose-battery [--db path] [--sysintel-exe path] [--min-history-days n] [--auto-approve] [--no-act]`. Wires a `SysIntelClient` to a `BatteryDiagnosticAgent`, prints which reasoning path ran, then the diagnosis. Also reconfigures stdout to UTF-8 on the way in — Windows' console defaults to a legacy codepage that can't encode a lot of ordinary Unicode punctuation an LLM will happily produce (hit this for real: a narrow no-break space in one response crashed the print before this fix).
+
+`handle_suggested_action()` is the actual approval gate for Phase 6's closed loop: if `diagnosis.suggested_action` is set and `--no-act` wasn't passed, it prints the action's description and asks `Apply this now? [y/N]` — unless `--auto-approve` skips the prompt. Only on a yes does it call `tools.apply_change_power_mode()`, then prints the resulting `ActionOutcome` the same way the CLI's own `sysintel act` would. Declining prints the exact equivalent `sysintel act` command instead, so nothing is lost by saying no.
 
 ### [`intelligence/requirements.txt`](intelligence/requirements.txt)
 `pydantic`, `groq`, and `python-dotenv`. Installed into its own virtual environment (`intelligence/.venv`, gitignored) rather than system-wide — keeps this project's dependencies from colliding with anything else on the machine.
@@ -589,6 +634,9 @@ copy intelligence\.env.example intelligence\.env
 
 # once there's an open incident in the database (see `check-battery` above):
 intelligence\.venv\Scripts\python -m intelligence.main diagnose-battery --db sysintel.db --sysintel-exe build\sysintel.exe
+
+# add --auto-approve to apply the suggested action without an interactive prompt,
+# or --no-act to never even offer one (diagnosis only)
 ```
 
 No key configured, or the API call fails for any reason? The agent automatically falls back to deterministic rule-based reasoning and says so explicitly (`[reasoned by: rule-based fallback]`) — it never silently produces a degraded result while claiming full reasoning.
@@ -601,6 +649,10 @@ Worth flagging explicitly: this is a conscious departure from the tech design's 
 
 The NVML path still specifically needs verification on real NVIDIA hardware before it's trustworthy — everything checkable without that hardware (dynamic-loading fallback, vendor dispatch, WMI-based inventory) has been.
 
-There's now a real Action Broker and one verified safe action (Phase 5), but nothing yet *calls* it automatically — `diagnose-battery`'s `recommended_action` is still just prose, and turning "Investigate which process is driving CPU usage" into an actual `sysintel act` invocation is a deliberate human/UI step this project hasn't built yet, matching the PRD's Level 2 ("Suggest") vs Level 3 ("Reversible action, approval required") distinction. The natural next action to add is one gated behind that same broker but touching something CPU-drain-specific (e.g. disabling a startup application) rather than only battery-mode; `best_performance`'s GUID mapping also still wants a live cross-check the way `best_power_efficiency` already got.
+The loop from diagnosis to action is now real (Phase 6) — `diagnose-battery` offers a concrete `sysintel act` invocation with an interactive approval prompt, `--auto-approve`, or a printed equivalent command on decline — but it's deliberately narrow: only one action exists, so it's suggested for every anomaly regardless of which hypothesis wins, rather than each hypothesis mapping to its own tailored fix. Once a second action exists (see below), `_build_suggested_action()` will need real logic for *which* action fits *which* winning hypothesis, instead of always proposing the same one.
+
+The natural next action to add is something CPU-drain-specific (e.g. disabling a startup application) rather than only battery-mode, gated behind the same broker; `best_performance`'s GUID mapping also still wants a live cross-check the way `best_power_efficiency` already got, and the NVML path still specifically needs verification on real NVIDIA hardware before it's trustworthy — everything checkable without that hardware (dynamic-loading fallback, vendor dispatch, WMI-based inventory) has been.
+
+Also worth flagging again: hypothesis-selection confidence is LLM-set, a conscious departure from the tech design's "don't let the LLM invent confidence" principle (§32) that still holds for every deterministic part of this system (the anomaly detector's threshold math, and now the action-suggestion logic, are both plain code). Verified reasonable in testing (75%/30% across the two tested branches); a rubric-based confidence *ceiling* remains the fallback plan if that trust turns out to be misplaced on harder cases later.
 
 Also still deliberately deferred: AMD/Intel GPU providers (currently always `unsupported`), true ETW-based event tracking (current events are polling-diffed, which misses anything that starts and exits between ~1s ticks), retention/rollup (collapse raw samples older than 24h into 1-minute aggregates, per the tech design), and the eventual named-pipe IPC to replace subprocess+JSON — none needed until their absence actually starts costing something.

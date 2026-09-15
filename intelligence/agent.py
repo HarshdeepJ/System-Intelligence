@@ -21,6 +21,21 @@ from .tools import SysIntelClient
 
 
 @dataclass
+class SuggestedAction:
+    """A concrete, runnable action -- computed here by plain code, never by
+    the LLM. This is the one thing keeping "close the loop" from becoming
+    "let the model decide what to execute": the model only ever produces
+    prose (recommended_action, finding, ...); this struct is built
+    separately from fixed rules and a fixed action_type/params shape that
+    action_broker.cpp already recognizes."""
+
+    action_type: str
+    params: dict[str, str]
+    reason: str
+    description: str  # human-readable summary shown before asking for approval
+
+
+@dataclass
 class Diagnosis:
     finding: str
     confidence: float
@@ -30,6 +45,25 @@ class Diagnosis:
     risk: str
     expected_result: str
     reasoned_by: str = "rule-based"  # "llm" or "rule-based" -- always disclosed
+    suggested_action: SuggestedAction | None = None
+
+
+def _build_suggested_action(check) -> SuggestedAction:
+    """The one action this project can currently take. Offered whenever
+    there's an open/ongoing battery anomaly, regardless of which hypothesis
+    the diagnosis settles on: Best Power Efficiency mode reduces both CPU-
+    and GPU-adjacent power draw at the OS level, so it's a reasonable,
+    fully-reversible thing to try even when the root cause isn't pinned
+    down exactly."""
+    return SuggestedAction(
+        action_type="change_power_mode",
+        params={"level": "best_power_efficiency"},
+        reason=(
+            f"battery drain anomaly: {check.live_mean_watts:.1f}W vs "
+            f"{check.baseline_mean_watts:.1f}W baseline"
+        ),
+        description="Switch Windows' battery Power Mode to 'Best power efficiency'",
+    )
 
 
 _HYPOTHESES = [
@@ -152,6 +186,7 @@ class BatteryDiagnosticAgent:
                 risk=result.risk,
                 expected_result=result.expected_result,
                 reasoned_by="llm",
+                suggested_action=_build_suggested_action(check),
             )
         except llm.LlmUnavailableError as exc:
             return self._fallback_diagnose(check, evidence, reason=str(exc))
@@ -195,6 +230,7 @@ class BatteryDiagnosticAgent:
                         f"{evidence['battery']['baseline_watts']}W baseline."
                     ),
                     reasoned_by="rule-based",
+                    suggested_action=_build_suggested_action(check),
                 )
             evidence_lines.append(
                 f"CPU utilization ({cpu_recent_avg}%) is close to its normal range -- "
@@ -213,4 +249,5 @@ class BatteryDiagnosticAgent:
             risk="n/a",
             expected_result="n/a",
             reasoned_by="rule-based",
+            suggested_action=_build_suggested_action(check),
         )

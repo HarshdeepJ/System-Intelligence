@@ -116,3 +116,16 @@ class SystemEvent(BaseModel):
 class EventsResult(BaseModel):
     last_minutes: int
     events: list[SystemEvent]
+
+
+class ActionOutcome(BaseModel):
+    """Mirrors core/actions/action_broker.hpp's ActionOutcome exactly."""
+
+    known_action: bool
+    approved: bool
+    executed: bool
+    success: bool
+    previous_state: str
+    new_state: str
+    message: str
+    action_id: str

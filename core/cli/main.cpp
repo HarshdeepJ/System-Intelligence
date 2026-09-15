@@ -439,8 +439,20 @@ void print_action_outcome(const ActionOutcome& outcome) {
     }
 }
 
+std::string json_action_outcome(const ActionOutcome& outcome) {
+    std::ostringstream out;
+    out << "{\"known_action\":" << (outcome.known_action ? "true" : "false")
+        << ",\"approved\":" << (outcome.approved ? "true" : "false")
+        << ",\"executed\":" << (outcome.executed ? "true" : "false")
+        << ",\"success\":" << (outcome.success ? "true" : "false") << ",\"previous_state\":\""
+        << json_escape(outcome.previous_state) << "\",\"new_state\":\""
+        << json_escape(outcome.new_state) << "\",\"message\":\"" << json_escape(outcome.message)
+        << "\",\"action_id\":\"" << json_escape(outcome.action_id) << "\"}";
+    return out.str();
+}
+
 int run_act_change_power_mode(const std::string& db_path, const std::string& level,
-                               const std::string& reason, bool approved) {
+                               const std::string& reason, bool approved, bool as_json) {
     SqliteStore store(db_path);
     ActionBroker broker(store);
 
@@ -449,14 +461,25 @@ int run_act_change_power_mode(const std::string& db_path, const std::string& lev
     request.reason = reason;
     request.params["level"] = level;
 
-    print_action_outcome(broker.execute(request, approved));
+    ActionOutcome outcome = broker.execute(request, approved);
+    if (as_json) {
+        std::cout << json_action_outcome(outcome) << std::endl;
+    } else {
+        print_action_outcome(outcome);
+    }
     return 0;
 }
 
-int run_act_rollback(const std::string& db_path, const std::string& action_id, bool approved) {
+int run_act_rollback(const std::string& db_path, const std::string& action_id, bool approved,
+                      bool as_json) {
     SqliteStore store(db_path);
     ActionBroker broker(store);
-    print_action_outcome(broker.rollback(action_id, approved));
+    ActionOutcome outcome = broker.rollback(action_id, approved);
+    if (as_json) {
+        std::cout << json_action_outcome(outcome) << std::endl;
+    } else {
+        print_action_outcome(outcome);
+    }
     return 0;
 }
 
@@ -699,6 +722,7 @@ int main(int argc, char** argv) {
         if (subcommand == "change-power-mode") {
             std::string level;
             std::string reason = "manual";
+            bool as_json = false;
             for (int i = 3; i < argc; ++i) {
                 std::string arg = argv[i];
                 if (arg == "--level" && i + 1 < argc) {
@@ -709,32 +733,38 @@ int main(int argc, char** argv) {
                     db_path = argv[++i];
                 } else if (arg == "--yes") {
                     approved = true;
+                } else if (arg == "--json") {
+                    as_json = true;
                 }
             }
             if (level.empty()) {
                 std::cerr << "usage: sysintel act change-power-mode --level "
                              "<best_power_efficiency|best_performance> [--reason <text>] "
-                             "[--db <path>] [--yes]\n";
+                             "[--db <path>] [--yes] [--json]\n";
                 return 1;
             }
-            return run_act_change_power_mode(db_path, level, reason, approved);
+            return run_act_change_power_mode(db_path, level, reason, approved, as_json);
         }
 
         if (subcommand == "rollback") {
             if (argc < 4) {
-                std::cerr << "usage: sysintel act rollback <action-id> [--db <path>] [--yes]\n";
+                std::cerr
+                    << "usage: sysintel act rollback <action-id> [--db <path>] [--yes] [--json]\n";
                 return 1;
             }
             std::string action_id = argv[3];
+            bool as_json = false;
             for (int i = 4; i < argc; ++i) {
                 std::string arg = argv[i];
                 if (arg == "--db" && i + 1 < argc) {
                     db_path = argv[++i];
                 } else if (arg == "--yes") {
                     approved = true;
+                } else if (arg == "--json") {
+                    as_json = true;
                 }
             }
-            return run_act_rollback(db_path, action_id, approved);
+            return run_act_rollback(db_path, action_id, approved, as_json);
         }
 
         std::cerr << "unknown 'act' subcommand: " << subcommand << "\n";

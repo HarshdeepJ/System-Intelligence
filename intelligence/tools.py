@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Union
 
-from .schemas import BatteryCheckReport, EventsResult, MetricHistory, SystemSnapshot
+from .schemas import ActionOutcome, BatteryCheckReport, EventsResult, MetricHistory, SystemSnapshot
 
 
 class SysIntelToolError(RuntimeError):
@@ -85,3 +85,32 @@ class SysIntelClient:
                 "--json",
             )
         )
+
+    def apply_change_power_mode(
+        self, level: str, reason: str, approved: bool = True
+    ) -> ActionOutcome:
+        """The one action this agent can take. `approved` defaults to True
+        because by the time main.py calls this, a human has already said
+        yes (interactively, or via --auto-approve) -- the actual approval
+        gate is main.py's prompt, not this method. Passing approved=False
+        gets a dry-run preview instead, same as the CLI's default."""
+        args = [
+            "act",
+            "change-power-mode",
+            "--level",
+            level,
+            "--reason",
+            reason,
+            "--db",
+            self._db,
+            "--json",
+        ]
+        if approved:
+            args.append("--yes")
+        return ActionOutcome.model_validate(self._run(*args))
+
+    def rollback_action(self, action_id: str, approved: bool = True) -> ActionOutcome:
+        args = ["act", "rollback", action_id, "--db", self._db, "--json"]
+        if approved:
+            args.append("--yes")
+        return ActionOutcome.model_validate(self._run(*args))
