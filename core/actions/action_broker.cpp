@@ -93,11 +93,25 @@ ActionOutcome ActionBroker::handle_change_power_mode(const ActionRequest& reques
         return outcome;
     }
 
-    bool ok = set_dc_power_mode(*level);
+    // Set both AC and DC together: Windows tracks them independently, but a
+    // user asking to "switch power mode" means the slider they can see, and
+    // that's the AC one whenever the machine happens to be plugged in --
+    // DC-only here previously meant the action silently did nothing visible
+    // for anyone on AC power at the time.
+    bool dc_ok = set_dc_power_mode(*level);
+    bool ac_ok = set_ac_power_mode(*level);
+    bool ok = dc_ok && ac_ok;
     outcome.executed = true;
     outcome.success = ok;
-    outcome.message =
-        ok ? "changed and verified" : "PowerSetUserConfiguredDCPowerMode failed or did not verify";
+    if (ok) {
+        outcome.message = "changed and verified";
+    } else if (dc_ok) {
+        outcome.message = "changed on battery, but PowerSetUserConfiguredACPowerMode failed or did not verify";
+    } else if (ac_ok) {
+        outcome.message = "changed while plugged in, but PowerSetUserConfiguredDCPowerMode failed or did not verify";
+    } else {
+        outcome.message = "PowerSetUserConfigured{AC,DC}PowerMode both failed or did not verify";
+    }
 
     ActionRecord record;
     record.action_type = request.action_type;
@@ -234,12 +248,18 @@ ActionOutcome ActionBroker::rollback_change_power_mode(const std::string& action
     outcome.new_state = record.previous_state;
 
     if (!approved) {
-        outcome.message = "dry run: would restore DC power mode to its state before " +
+        outcome.message = "dry run: would restore power mode (AC and DC) to its state before " +
                            action_id + ". Pass approval to apply.";
         return outcome;
     }
 
-    bool ok = set_dc_power_mode_raw_guid(record.previous_state);
+    // record.previous_state is a DC GUID, but AC and DC share the same pair
+    // of overlay GUIDs (best_power_efficiency/best_performance), so it's
+    // equally valid to restore both to it -- matches how the forward action
+    // above sets both to the same target.
+    bool dc_ok = set_dc_power_mode_raw_guid(record.previous_state);
+    bool ac_ok = set_ac_power_mode_raw_guid(record.previous_state);
+    bool ok = dc_ok && ac_ok;
     outcome.executed = true;
     outcome.success = ok;
     outcome.message = ok ? "rolled back and verified" : "rollback failed or did not verify";

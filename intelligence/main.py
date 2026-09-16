@@ -1,19 +1,32 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
+from . import chat
 from .agent import Diagnosis, DiagnosticAgent
+from .llm import LlmUnavailableError
 from .schemas import ActionOutcome
 from .tools import SysIntelClient, SysIntelToolError
 
 # Windows' console defaults to a legacy codepage (cp1252) that can't encode
 # a lot of ordinary Unicode punctuation (curly quotes, narrow no-break
 # spaces, em dashes...) an LLM will happily produce. Reconfigure stdout to
-# UTF-8 so a model's word choice can never crash the CLI.
+# UTF-8 so a model's word choice can never crash the CLI -- and stdin too,
+# since `ask` reads its request as UTF-8 JSON from a pipe (the PixelMini UI
+# writes raw UTF-8 bytes; the default console codepage would mangle it).
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stdin, "reconfigure"):
+    # utf-8-sig rather than plain utf-8: .NET's Process.StandardInput writer
+    # prepends a UTF-8 BOM to a redirected child's stdin pipe regardless of
+    # how the bytes are actually written (observed from the PixelMini UI
+    # side, even writing raw bytes straight to its BaseStream) -- utf-8-sig
+    # quietly consumes a leading BOM if present and behaves exactly like
+    # utf-8 if not, so this is correct either way `ask` gets invoked.
+    sys.stdin.reconfigure(encoding="utf-8-sig", errors="replace")
 
 
 def print_diagnosis(diagnosis: Diagnosis) -> None:
@@ -120,6 +133,65 @@ def default_sysintel_exe() -> str:
     return str(Path(__file__).resolve().parent.parent / "build" / "sysintel.exe")
 
 
+def _read_ask_request() -> tuple[str, list[dict]]:
+    """The PixelMini UI sends its request as a single JSON object on stdin
+    -- {"question": ..., "history": [{"role": "user"|"pixel", "text": ...}]}
+    -- rather than argv, so arbitrarily long or quote-laden chat text never
+    has to survive Windows command-line escaping."""
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        print(f"[ask] request wasn't valid JSON, treating as empty: {exc}", file=sys.stderr)
+        payload = {}
+    question = str(payload.get("question", "")).strip()
+    history = payload.get("history") or []
+    return question, history
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    question, history = _read_ask_request()
+    if not question:
+        print(json.dumps({"answer": "I didn't quite catch a question there.", "reasoned_by": "fallback"}))
+        return 0
+
+    tools = SysIntelClient(args.sysintel_exe, args.db)
+    try:
+        snapshot = tools.get_raw_status()
+    except SysIntelToolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print(json.dumps({
+            "answer": "I can't check on myself right now -- something's wrong talking to my own sensors.",
+            "reasoned_by": "fallback",
+        }))
+        return 0
+
+    # Best-effort: top_processes_by_memory is already in `status --json`, but
+    # a "close the app eating my CPU" question needs the CPU-sorted list too.
+    # This is the only set of pids ask_pixel/_sanitize_action will ever
+    # accept for a suspend_process proposal, so leaving it out on failure
+    # just means fewer valid targets, never a crash.
+    try:
+        snapshot["top_processes_by_cpu"] = [p.model_dump() for p in tools.get_top_processes_by_cpu(limit=8)]
+    except SysIntelToolError:
+        pass
+
+    try:
+        result = chat.ask_pixel(question, snapshot, history)
+        reasoned_by = "llm"
+    except LlmUnavailableError as exc:
+        print(f"[ask] LLM unavailable, falling back: {exc}", file=sys.stderr)
+        result = chat.fallback_answer(snapshot)
+        reasoned_by = "fallback"
+
+    print(json.dumps({
+        "answer": result.answer,
+        "reasoned_by": reasoned_by,
+        "proposed_action": result.proposed_action.model_dump() if result.proposed_action else None,
+    }))
+    return 0
+
+
 # Every domain DiagnosticAgent knows about (see agent.py's _DOMAINS) gets the
 # same diagnose-<domain> subcommand, wired up identically -- only the domain
 # name and help text differ.
@@ -152,14 +224,28 @@ def _add_diagnose_subparser(sub: argparse._SubParsersAction, command: str, help_
     )
 
 
+def _add_ask_subparser(sub: argparse._SubParsersAction) -> None:
+    ask = sub.add_parser(
+        "ask",
+        help="Answer a free-form question in Pixel's voice, grounded in a live system "
+        'snapshot. Reads {"question": ..., "history": [...]} as JSON from stdin.',
+    )
+    ask.add_argument("--db", default="sysintel.db")
+    ask.add_argument("--sysintel-exe", default=default_sysintel_exe())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="intelligence")
     sub = parser.add_subparsers(dest="command", required=True)
 
     for command, (_, help_text) in _DIAGNOSE_COMMANDS.items():
         _add_diagnose_subparser(sub, command, help_text)
+    _add_ask_subparser(sub)
 
     args = parser.parse_args(argv)
+
+    if args.command == "ask":
+        return cmd_ask(args)
 
     if args.command in _DIAGNOSE_COMMANDS:
         domain, _ = _DIAGNOSE_COMMANDS[args.command]

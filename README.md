@@ -32,7 +32,10 @@ This repo now spans two runtimes:
 **A Python reasoning agent** (`intelligence/`, Phase 4 — real LLM reasoning via Groq, Phase 6 closes the loop into an actual action, Phase 10 generalizes it beyond battery, Phase 11 extends that to all seven domains):
 - `diagnose-battery` / `diagnose-memory` / `diagnose-cpu` / `diagnose-network` / `diagnose-disk` / `diagnose-top-cpu` / `diagnose-thermal` / `diagnose-fan` `[--auto-approve] [--no-act]` — investigates an open anomaly in that domain: collects evidence via the CLI's `--json` output, sends it to an LLM for hypothesis selection, prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format, and — for battery/cpu/thermal/fan (a `change_power_mode` suggestion) or memory/top-cpu (a targeted `suspend_process` suggestion), unless `--no-act` — offers a concrete, runnable action with an interactive approval prompt (or applies it automatically with `--auto-approve`)
 
-Everything else (the native UI and AMD/Intel GPU telemetry) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+A first native WPF companion prototype now lives in `ui/PixelMini/`; it is not
+yet wired to live telemetry. AMD/Intel GPU telemetry remains designed but not
+built. Both sit on top of the existing collector + storage + detector +
+tool-client code without needing to change it.
 
 ### Phase 8: the missing collectors — network, disk I/O, per-process CPU, thermal/fan
 

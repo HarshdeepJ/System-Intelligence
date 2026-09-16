@@ -206,6 +206,31 @@ bool set_dc_power_mode_raw_guid(const std::string& guid_string) {
     return to_lower(get_dc_power_mode_raw_guid()) == to_lower(guid_string);
 }
 
+std::string get_ac_power_mode_raw_guid() {
+    GUID guid{};
+    PowerGetUserConfiguredACPowerMode(&guid);  // same all-zero-on-failure contract as the DC read
+    return guid_to_string(guid);
+}
+
+bool set_ac_power_mode(PowerModeLevel level) {
+    GUID guid = power_mode_guid(level);
+    if (PowerSetUserConfiguredACPowerMode(&guid) != ERROR_SUCCESS) {
+        return false;
+    }
+    return to_lower(get_ac_power_mode_raw_guid()) == to_lower(guid_to_string(guid));
+}
+
+bool set_ac_power_mode_raw_guid(const std::string& guid_string) {
+    GUID guid{};
+    if (!guid_from_string(guid_string, guid)) {
+        return false;
+    }
+    if (PowerSetUserConfiguredACPowerMode(&guid) != ERROR_SUCCESS) {
+        return false;
+    }
+    return to_lower(get_ac_power_mode_raw_guid()) == to_lower(guid_string);
+}
+
 std::vector<PowerScheme> debug_enumerate_overlay_schemes() {
     std::vector<PowerScheme> result;
     for (ULONG index = 0;; ++index) {

@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PROTOTYPE — Ambient System Glow</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --state-a: #a6f3ff;
+      --state-b: #91b1ff;
+      --state-core: #fbfdff;
+      --state-c: #c9a8ff;
+      --state-d: #efb0d2;
+      --energy: .48;
+      font-family: Inter, "Segoe UI Variable", "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      background:
+        radial-gradient(ellipse at 50% 0%, rgba(80, 110, 185, .14), transparent 40%),
+        radial-gradient(circle at 20% 30%, rgba(39, 71, 128, .2), transparent 28%),
+        linear-gradient(140deg, #101522 0%, #151d2c 48%, #0b1019 100%);
+      color: #edf3ff;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      opacity: .12;
+      pointer-events: none;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.18'/%3E%3C/svg%3E");
+    }
+
+    .prototype-note {
+      position: fixed;
+      left: 18px;
+      top: 16px;
+      color: rgba(230, 239, 255, .58);
+      font: 600 10px/1.2 ui-monospace, Consolas, monospace;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .desktop-copy {
+      position: fixed;
+      left: 50%;
+      top: 44%;
+      width: min(560px, 80vw);
+      transform: translate(-50%, -50%);
+      text-align: center;
+      pointer-events: none;
+      opacity: .86;
+    }
+    .desktop-copy h1 { margin: 0 0 10px; font-size: clamp(26px, 4vw, 50px); font-weight: 540; letter-spacing: -.04em; }
+    .desktop-copy p { margin: 0; color: rgba(220, 231, 250, .55); font-size: 14px; }
+
+    .taskbar {
+      position: fixed;
+      inset: auto 0 0;
+      height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: rgba(14, 19, 29, .78);
+      border-top: 1px solid rgba(255,255,255,.07);
+      backdrop-filter: blur(22px) saturate(140%);
+    }
+    .taskbar i { width: 24px; height: 24px; border-radius: 7px; background: rgba(255,255,255,.1); box-shadow: inset 0 1px rgba(255,255,255,.08); }
+
+    .glow-stage { position: fixed; inset: 0; pointer-events: none; }
+    .variant { display: none; position: absolute; inset: 0; }
+    body[data-variant="A"] .variant-a,
+    body[data-variant="B"] .variant-b,
+    body[data-variant="C"] .variant-c { display: block; }
+
+    /* A — a compact living halo suspended just beneath the top edge. */
+    .halo {
+      position: absolute;
+      left: 50%; top: -5px;
+      width: 176px; height: 30px;
+      transform: translateX(-50%);
+      animation: halo-breathe 5.4s ease-in-out infinite;
+    }
+    .halo::before {
+      content: ""; position: absolute; inset: 3px 10px 8px;
+      border-radius: 0 0 55% 55%;
+      background: linear-gradient(90deg,
+        transparent 2%,
+        var(--state-a) 17%,
+        var(--state-b) 36%,
+        var(--state-core) 50%,
+        var(--state-c) 66%,
+        var(--state-d) 83%,
+        transparent 98%);
+      filter: blur(5px) saturate(108%);
+      opacity: calc(.32 + var(--energy) * .44);
+      box-shadow:
+        0 7px 24px color-mix(in srgb, var(--state-b) 42%, transparent),
+        0 18px 48px color-mix(in srgb, var(--state-c) 22%, transparent);
+    }
+    .halo::after {
+      content: ""; position: absolute; left: 50%; top: 0;
+      width: 108px; height: 3px; transform: translateX(-50%);
+      border-radius: 0 0 10px 10px;
+      background: linear-gradient(90deg,
+        transparent,
+        color-mix(in srgb, var(--state-a) 74%, white) 23%,
+        var(--state-core) 50%,
+        color-mix(in srgb, var(--state-d) 64%, white) 77%,
+        transparent);
+      box-shadow:
+        0 2px 7px color-mix(in srgb, var(--state-core) 75%, transparent),
+        0 8px 25px color-mix(in srgb, var(--state-b) 58%, transparent),
+        0 18px 54px color-mix(in srgb, var(--state-c) 30%, transparent);
+      opacity: calc(.54 + var(--energy) * .36);
+    }
+    .halo-wisp { position: absolute; left: 28px; right: 28px; top: 5px; height: 20px; overflow: hidden; filter: blur(5px); }
+    .halo-wisp::before {
+      content: ""; position: absolute; width: 62px; height: 11px; border-radius: 50%;
+      background: linear-gradient(90deg, var(--state-a), var(--state-c), var(--state-d));
+      opacity: .22; animation: halo-drift 5.8s ease-in-out infinite alternate;
+    }
+
+    /* B — the system exists as light travelling through the physical edge. */
+    .edge-aura {
+      position: absolute; left: 50%; top: 0; width: min(520px, 44vw); height: 72px;
+      transform: translateX(-50%); overflow: hidden;
+    }
+    .edge-aura::before {
+      content: ""; position: absolute; left: 4%; right: 4%; top: -10px; height: 18px;
+      border-radius: 50%;
+      background: linear-gradient(90deg, transparent 3%, var(--state-a), var(--state-b), var(--state-c), transparent 97%);
+      box-shadow: 0 8px 22px var(--state-b), 0 22px 56px color-mix(in srgb, var(--state-c) 58%, transparent);
+      filter: blur(4px); opacity: calc(.28 + var(--energy) * .48);
+      animation: edge-flow 4.2s ease-in-out infinite alternate;
+    }
+    .edge-aura::after {
+      content: ""; position: absolute; left: 14%; right: 14%; top: 0; height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,.9), transparent);
+      opacity: .7;
+    }
+
+    /* C — almost absent: a tiny seed wakes and casts a soft downward presence. */
+    .light-seed {
+      position: absolute; left: 50%; top: 0; width: 44px; height: 44px;
+      transform: translateX(-50%);
+    }
+    .light-seed::before {
+      content: ""; position: absolute; left: 50%; top: -3px; width: 10px; height: 10px;
+      transform: translateX(-50%); border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 0 5px #fff, 0 0 12px var(--state-a), 0 0 24px var(--state-b), 0 0 46px var(--state-c);
+      animation: seed-pulse 3.8s ease-in-out infinite;
+    }
+    .light-seed::after {
+      content: ""; position: absolute; left: 50%; top: 5px; width: 42px; height: 40px;
+      transform: translateX(-50%); border-radius: 50%;
+      background: radial-gradient(ellipse at top, color-mix(in srgb, var(--state-a) 36%, transparent), transparent 68%);
+      filter: blur(5px); opacity: calc(.25 + var(--energy) * .5);
+    }
+
+    body[data-state="listening"] {
+      --state-a: #82f2ff; --state-b: #76bdff; --state-core: #ffffff;
+      --state-c: #a88fff; --state-d: #dda4e4; --energy: .82;
+    }
+    body[data-state="thinking"] {
+      --state-a: #66e9ff; --state-b: #789fff; --state-core: #f7f5ff;
+      --state-c: #a878f1; --state-d: #e98bc5; --energy: .78;
+    }
+    body[data-state="concern"] {
+      --state-a: #ffe0a0; --state-b: #ffb378; --state-core: #fff9ed;
+      --state-c: #ff8c91; --state-d: #d989bc; --energy: .84;
+    }
+    body[data-state="resolved"] {
+      --state-a: #aaffdf; --state-b: #78e8ca; --state-core: #f5fffd;
+      --state-c: #7fcfff; --state-d: #b6aeed; --energy: .72;
+    }
+    body[data-state="thinking"] .halo,
+    body[data-state="thinking"] .edge-aura,
+    body[data-state="thinking"] .light-seed { animation-duration: 1.9s; }
+    body[data-state="concern"] .halo,
+    body[data-state="concern"] .edge-aura,
+    body[data-state="concern"] .light-seed { animation: concern-beat 1.5s ease-in-out infinite; }
+
+    .state-panel {
+      position: fixed; right: 18px; top: 16px; display: flex; gap: 5px; padding: 5px;
+      border: 1px solid rgba(255,255,255,.1); border-radius: 12px;
+      background: rgba(10, 14, 23, .62); backdrop-filter: blur(16px);
+    }
+    button { font: inherit; color: inherit; border: 0; cursor: pointer; }
+    .state-panel button {
+      padding: 7px 9px; border-radius: 8px; color: rgba(233,241,255,.58); background: transparent; font-size: 11px;
+    }
+    .state-panel button.active { color: #fff; background: rgba(255,255,255,.12); }
+
+    .switcher {
+      position: fixed; left: 50%; bottom: 67px; transform: translateX(-50%);
+      display: flex; align-items: center; gap: 8px; padding: 7px;
+      border: 1px solid rgba(255,255,255,.13); border-radius: 999px;
+      background: rgba(7, 10, 17, .88); box-shadow: 0 12px 42px rgba(0,0,0,.45); backdrop-filter: blur(18px);
+    }
+    .switcher button { width: 31px; height: 31px; border-radius: 50%; background: rgba(255,255,255,.1); font-size: 16px; }
+    .variant-label { min-width: 170px; text-align: center; font-size: 12px; color: rgba(238,244,255,.8); }
+
+    @keyframes halo-breathe { 0%,100% { transform: translateX(-50%) scaleX(.96); opacity: .72; } 50% { transform: translateX(-50%) scaleX(1.03); opacity: 1; } }
+    @keyframes halo-drift { from { transform: translateX(0); } to { transform: translateX(58px); } }
+    @keyframes edge-flow { from { transform: translateX(-3%) scaleX(.94); } to { transform: translateX(3%) scaleX(1.04); } }
+    @keyframes seed-pulse { 0%,100% { transform: translateX(-50%) scale(.8); opacity: .62; } 50% { transform: translateX(-50%) scale(1.05); opacity: 1; } }
+    @keyframes concern-beat { 0%,100% { opacity: .55; } 12% { opacity: 1; } 23% { opacity: .62; } 35% { opacity: .95; } 52% { opacity: .56; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; } }
+  </style>
+</head>
+<body data-variant="A" data-state="idle">
+  <!-- PROTOTYPE: Three formless top-center system-presence directions, switchable via ?variant=. -->
+  <div class="prototype-note">Throwaway prototype · ambient system presence</div>
+  <div class="desktop-copy"><h1>Your computer, quietly present.</h1><p>Change the system state above, then compare the three glow directions below.</p></div>
+  <div class="glow-stage">
+    <div class="variant variant-a"><div class="halo"><i class="halo-wisp"></i></div></div>
+    <div class="variant variant-b"><div class="edge-aura"></div></div>
+    <div class="variant variant-c"><div class="light-seed"></div></div>
+  </div>
+  <div class="state-panel" aria-label="Simulated system state"></div>
+  <div class="switcher" aria-label="Prototype variant switcher">
+    <button class="previous" aria-label="Previous variant">←</button>
+    <span class="variant-label"></span>
+    <button class="next" aria-label="Next variant">→</button>
+  </div>
+  <div class="taskbar"><i></i><i></i><i></i><i></i><i></i></div>
+  <script>
+    const variants = [
+      { key: 'A', name: 'Living Halo' },
+      { key: 'B', name: 'Edge Aura' },
+      { key: 'C', name: 'Light Seed' }
+    ];
+    const states = ['idle', 'listening', 'thinking', 'concern', 'resolved'];
+    const params = new URLSearchParams(location.search);
+    let variant = variants.some(v => v.key === params.get('variant')) ? params.get('variant') : 'A';
+    let state = states.includes(params.get('state')) ? params.get('state') : 'idle';
+    const label = document.querySelector('.variant-label');
+    const statePanel = document.querySelector('.state-panel');
+
+    function syncUrl() {
+      const next = new URL(location.href);
+      next.searchParams.set('variant', variant);
+      next.searchParams.set('state', state);
+      history.replaceState({}, '', next);
+    }
+    function render() {
+      document.body.dataset.variant = variant;
+      document.body.dataset.state = state;
+      const current = variants.find(v => v.key === variant);
+      label.textContent = `${current.key} — ${current.name}`;
+      statePanel.innerHTML = states.map(s => `<button data-state="${s}" class="${s === state ? 'active' : ''}">${s[0].toUpperCase()+s.slice(1)}</button>`).join('');
+      syncUrl();
+    }
+    function cycle(delta) { const i = variants.findIndex(v => v.key === variant); variant = variants[(i + delta + variants.length) % variants.length].key; render(); }
+    document.querySelector('.previous').onclick = () => cycle(-1);
+    document.querySelector('.next').onclick = () => cycle(1);
+    statePanel.onclick = e => { const next = e.target.dataset.state; if (next) { state = next; render(); } };
+    addEventListener('keydown', e => { if (e.key === 'ArrowLeft') cycle(-1); if (e.key === 'ArrowRight') cycle(1); });
+    render();
+  </script>
+</body>
+</html>

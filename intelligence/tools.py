@@ -61,6 +61,13 @@ class SysIntelClient:
     def get_system_snapshot(self) -> SystemSnapshot:
         return SystemSnapshot.model_validate(self._run("status", "--json"))
 
+    def get_raw_status(self) -> dict:
+        """Same call as get_system_snapshot(), but returns the parsed JSON
+        as-is rather than validating it against SystemSnapshot -- for
+        consumers like chat.py that want the full payload (thermal,
+        disk_space, ...) without every field needing a schema entry."""
+        return self._run("status", "--json")
+
     def get_metric_history(self, metric: str, last_minutes: int = 30) -> MetricHistory:
         return MetricHistory.model_validate(
             self._run(

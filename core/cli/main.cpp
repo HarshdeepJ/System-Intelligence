@@ -52,6 +52,77 @@ std::string json_reading(const Reading<T>& r) {
     return out.str();
 }
 
+std::string json_thermal_state(const ThermalAndFanState& state) {
+    std::ostringstream out;
+    out << "{\"zones\":[";
+    for (size_t i = 0; i < state.thermal_zones.size(); ++i) {
+        if (i > 0) out << ",";
+        const auto& z = state.thermal_zones[i];
+        out << "{\"name\":\"" << json_escape(z.name) << "\",\"temperature_celsius\":"
+            << json_reading(z.temperature_celsius) << "}";
+    }
+    out << "],\"fans\":[";
+    for (size_t i = 0; i < state.fans.size(); ++i) {
+        if (i > 0) out << ",";
+        const auto& f = state.fans[i];
+        out << "{\"name\":\"" << json_escape(f.name) << "\",\"rpm\":" << json_reading(f.rpm) << "}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+std::string json_disk_io_array(const std::vector<DiskIoState>& disks) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < disks.size(); ++i) {
+        if (i > 0) out << ",";
+        const auto& d = disks[i];
+        out << "{\"instance\":\"" << json_escape(d.instance) << "\""
+            << ",\"read_bytes_per_sec\":" << json_reading(d.read_bytes_per_sec)
+            << ",\"write_bytes_per_sec\":" << json_reading(d.write_bytes_per_sec)
+            << ",\"reads_per_sec\":" << json_reading(d.reads_per_sec)
+            << ",\"writes_per_sec\":" << json_reading(d.writes_per_sec)
+            << ",\"queue_length\":" << json_reading(d.queue_length) << "}";
+    }
+    out << "]";
+    return out.str();
+}
+
+std::string json_network_array(const std::vector<NetworkAdapterState>& adapters) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < adapters.size(); ++i) {
+        if (i > 0) out << ",";
+        const auto& a = adapters[i];
+        out << "{\"name\":\"" << json_escape(a.name) << "\",\"type\":\"" << json_escape(a.type)
+            << "\",\"operational\":" << (a.operational ? "true" : "false")
+            << ",\"link_speed_bps\":" << json_reading(a.link_speed_bps)
+            << ",\"bytes_sent_per_sec\":" << json_reading(a.bytes_sent_per_sec)
+            << ",\"bytes_received_per_sec\":" << json_reading(a.bytes_received_per_sec)
+            << ",\"wifi_signal_percent\":" << json_reading(a.wifi_signal_percent) << "}";
+    }
+    out << "]";
+    return out.str();
+}
+
+// Best-effort free/total space for the drive Windows itself is installed on.
+// Not a Reading<T>: GetDiskFreeSpaceExW either works or the whole field is
+// omitted, there's no meaningful unsupported/unavailable distinction here.
+bool get_system_drive_space(uint64_t* total_bytes, uint64_t* free_bytes) {
+    wchar_t windows_dir[MAX_PATH];
+    if (GetWindowsDirectoryW(windows_dir, MAX_PATH) == 0) {
+        return false;
+    }
+    wchar_t root[4] = {windows_dir[0], L':', L'\\', L'\0'};
+    ULARGE_INTEGER free_available, total, free_total;
+    if (!GetDiskFreeSpaceExW(root, &free_available, &total, &free_total)) {
+        return false;
+    }
+    *total_bytes = total.QuadPart;
+    *free_bytes = free_total.QuadPart;
+    return true;
+}
+
 std::string json_gpu_array(const std::vector<GpuState>& gpus) {
     std::ostringstream out;
     out << "[";
@@ -100,6 +171,16 @@ int run_status_json() {
 
     out << ",\"gpu\":" << json_gpu_array(gpus);
 
+    out << ",\"thermal\":" << json_thermal_state(get_thermal_and_fan_state());
+
+    uint64_t drive_total_bytes = 0, drive_free_bytes = 0;
+    if (get_system_drive_space(&drive_total_bytes, &drive_free_bytes)) {
+        out << ",\"disk_space\":{\"total_bytes\":" << drive_total_bytes
+            << ",\"free_bytes\":" << drive_free_bytes << "}";
+    } else {
+        out << ",\"disk_space\":null";
+    }
+
     out << ",\"top_processes_by_memory\":[";
     for (size_t i = 0; i < processes.size(); ++i) {
         if (i > 0) out << ",";
@@ -127,7 +208,12 @@ void print_reading(const std::string& label, const Reading<T>& r) {
 
 void print_event(const SystemEvent& event);  // defined further below, used here for --db output
 
-int run_network() {
+int run_network(bool as_json) {
+    if (as_json) {
+        auto adapters = get_network_state();
+        std::cout << json_network_array(adapters) << std::endl;
+        return 0;
+    }
     std::cout << "(sampling for 1 second...)\r" << std::flush;
     auto adapters = get_network_state();
     std::cout << "Network adapters (physical only)          \n\n";
@@ -161,8 +247,12 @@ int run_network() {
     return 0;
 }
 
-int run_thermal() {
+int run_thermal(bool as_json) {
     auto state = get_thermal_and_fan_state();
+    if (as_json) {
+        std::cout << json_thermal_state(state) << std::endl;
+        return 0;
+    }
     std::cout << "Thermal zones\n";
     for (const auto& z : state.thermal_zones) {
         std::cout << "  " << z.name << "  ";
@@ -214,7 +304,12 @@ int run_top_cpu(int limit, bool as_json) {
     return 0;
 }
 
-int run_disk() {
+int run_disk(bool as_json) {
+    if (as_json) {
+        auto disks = get_disk_io_state();
+        std::cout << json_disk_io_array(disks) << std::endl;
+        return 0;
+    }
     std::cout << "(sampling for 1 second...)\r" << std::flush;
     auto disks = get_disk_io_state();
     std::cout << "Disk I/O (live)                     \n\n";
@@ -254,17 +349,24 @@ int run_power_schemes() {
                    << "]" << (is_active ? "  (active)" : "") << "\n";
     }
 
-    std::cout << "\nPower Mode slider (on battery / DC):\n";
-    std::string dc_guid = get_dc_power_mode_raw_guid();
-    if (dc_guid == guid_to_string(power_mode_guid(PowerModeLevel::kBestPowerEfficiency))) {
-        std::cout << "  " << power_mode_name(PowerModeLevel::kBestPowerEfficiency) << "  [" << dc_guid
-                   << "]\n";
-    } else if (dc_guid == guid_to_string(power_mode_guid(PowerModeLevel::kBestPerformance))) {
-        std::cout << "  " << power_mode_name(PowerModeLevel::kBestPerformance) << "  [" << dc_guid
-                   << "]\n";
-    } else {
-        std::cout << "  unrecognized/balanced  [" << dc_guid << "]\n";
-    }
+    auto print_slider = [](const char* label, const std::string& guid) {
+        std::cout << "\nPower Mode slider (" << label << "):\n";
+        if (guid == guid_to_string(power_mode_guid(PowerModeLevel::kBestPowerEfficiency))) {
+            std::cout << "  " << power_mode_name(PowerModeLevel::kBestPowerEfficiency) << "  [" << guid
+                       << "]\n";
+        } else if (guid == guid_to_string(power_mode_guid(PowerModeLevel::kBestPerformance))) {
+            std::cout << "  " << power_mode_name(PowerModeLevel::kBestPerformance) << "  [" << guid
+                       << "]\n";
+        } else {
+            std::cout << "  unrecognized/balanced  [" << guid << "]\n";
+        }
+    };
+    // change_power_mode sets both together (see action_broker.cpp), but
+    // Windows tracks them independently -- showing both here is what caught
+    // the bug where only DC was ever being set, silently doing nothing
+    // visible for anyone plugged in at the time.
+    print_slider("on battery / DC", get_dc_power_mode_raw_guid());
+    print_slider("plugged in / AC", get_ac_power_mode_raw_guid());
 
     std::cout << "\nOverlay schemes Windows itself reports (debug):\n";
     for (const auto& s : debug_enumerate_overlay_schemes()) {
@@ -908,6 +1010,9 @@ int run_watch(const std::string& db_path, int min_history_days) {
 void print_usage() {
     std::cerr << "usage:\n"
                << "  sysintel status [--json]\n"
+               << "  sysintel thermal [--json]\n"
+               << "  sysintel disk [--json]\n"
+               << "  sysintel network [--json]\n"
                << "  sysintel inspect [--db <path>]\n"
                << "  sysintel record [--db <path>]\n"
                << "  sysintel watch [--db <path>] [--min-history-days <n>]\n"
@@ -939,11 +1044,13 @@ int main(int argc, char** argv) {
     }
 
     if (command == "network") {
-        return run_network();
+        bool as_json = argc > 2 && std::string(argv[2]) == "--json";
+        return run_network(as_json);
     }
 
     if (command == "disk") {
-        return run_disk();
+        bool as_json = argc > 2 && std::string(argv[2]) == "--json";
+        return run_disk(as_json);
     }
 
     if (command == "top-cpu") {
@@ -961,7 +1068,8 @@ int main(int argc, char** argv) {
     }
 
     if (command == "thermal") {
-        return run_thermal();
+        bool as_json = argc > 2 && std::string(argv[2]) == "--json";
+        return run_thermal(as_json);
     }
 
     if (command == "power-schemes") {

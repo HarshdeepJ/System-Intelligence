@@ -67,6 +67,17 @@ std::string get_dc_power_mode_raw_guid();
 bool set_dc_power_mode(PowerModeLevel level);
 bool set_dc_power_mode_raw_guid(const std::string& guid_string);
 
+// The AC-side counterpart of the above. Windows tracks the Power Mode
+// slider separately per power source -- on a plugged-in machine, the
+// slider actually shown in Settings (and the one a user sees change) is
+// the AC one, not the DC one above. change_power_mode sets both together
+// so "switch to performance mode" behaves the same regardless of whether
+// the machine happens to be on AC or battery at the moment -- found by a
+// user reporting the DC-only version silently did nothing while plugged in.
+std::string get_ac_power_mode_raw_guid();
+bool set_ac_power_mode(PowerModeLevel level);
+bool set_ac_power_mode_raw_guid(const std::string& guid_string);
+
 std::vector<PowerScheme> debug_enumerate_overlay_schemes();
 
 }  // namespace sysintel
