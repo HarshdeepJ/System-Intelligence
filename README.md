@@ -454,14 +454,17 @@ Confidence: 60%
 ```mermaid
 flowchart TD
     subgraph CLI["core/cli — the dashboard"]
-        MAIN["main.cpp<br/>status | record | history | watch | check-battery"]
+        MAIN["main.cpp<br/>status | record | history | watch<br/>check-&lt;domain&gt; | act | actions"]
     end
 
     subgraph COLLECTORS["core/collectors — one sensor each"]
         BAT["battery.hpp / battery.cpp<br/>returns: BatterySnapshot"]
         CPU["cpu.hpp / cpu.cpp<br/>returns: CpuSnapshot"]
         MEM["memory.hpp / memory.cpp<br/>returns: MemorySnapshot"]
-        PROC["process.hpp / process.cpp<br/>returns: list of ProcessInfo"]
+        PROC["process.hpp / process.cpp<br/>top-by-memory, top-by-cpu, identities"]
+        NET["network.cpp (Phase 8)<br/>returns: list of NetworkAdapterState"]
+        DISK["disk_io.cpp (Phase 8)<br/>returns: list of DiskIoState"]
+        THERM["thermal.cpp (Phase 8)<br/>returns: ThermalAndFanState"]
     end
 
     subgraph WINAPI["Windows itself"]
@@ -469,10 +472,13 @@ flowchart TD
         W2["PDH performance counters"]
         W3["GlobalMemoryStatusEx()"]
         W4["CreateToolhelp32Snapshot()<br/>GetProcessMemoryInfo()"]
+        W5["IP Helper API: GetIfTable2()"]
+        W6["PDH: \PhysicalDisk(*) counters"]
+        W7["WMI ROOT\WMI / ROOT\CIMV2<br/>thermal zone + fan classes"]
     end
 
     subgraph SAMPLER["core/sampler — the recording loop"]
-        SAMP["sampler.hpp / sampler.cpp<br/>ticks, buffers, flushes"]
+        SAMP["sampler.hpp / sampler.cpp<br/>ticks, buffers, flushes<br/>7 metric families since Phase 11"]
     end
 
     subgraph STORAGE["core/storage — the history layer"]
@@ -481,7 +487,12 @@ flowchart TD
     end
 
     subgraph ANOMALY["core/anomalies — the fast brain"]
-        DETECT["battery_detector.hpp / .cpp<br/>check(): baseline vs right-now"]
+        GDETECT["anomaly_detector.cpp: AnomalyDetector<br/>metric-agnostic check() (Phase 7)<br/>baseline vs right-now, for any of 6 metrics"]
+        BDETECT["battery_detector.cpp<br/>thin wrapper around AnomalyDetector<br/>(battery.discharge_watts, only while discharging)"]
+    end
+
+    subgraph ACTIONS["core/actions — the only path to a mutation"]
+        ABROKER["action_broker.cpp<br/>execute()/rollback(), dispatched by action_type<br/>(details in Phase 5/12's own diagram below)"]
     end
 
     SQLITE["third_party/sqlite<br/>vendored sqlite3.c/.h"]
@@ -490,24 +501,37 @@ flowchart TD
     MAIN --> CPU
     MAIN --> MEM
     MAIN --> PROC
+    MAIN -->|"debug: network/disk/top-cpu/thermal"| NET
+    MAIN --> DISK
+    MAIN --> THERM
 
     MAIN -->|"record"| SAMP
     MAIN -->|"history"| STORE
-    MAIN -->|"check-battery"| DETECT
+    MAIN -->|"check-battery"| BDETECT
+    MAIN -->|"check-memory/cpu/network/disk/top-cpu/thermal"| GDETECT
     MAIN -->|"watch: record +"| SAMP
+    MAIN -->|"act change-power-mode / suspend-process / rollback"| ABROKER
 
     SAMP -->|"loops, calling"| BAT
     SAMP --> CPU
     SAMP --> MEM
+    SAMP -->|"every 5s: network/disk/top-cpu/thermal"| NET
+    SAMP --> DISK
+    SAMP --> THERM
     SAMP -->|"insert_batch()"| STORE
-    SAMP -.->|"periodic hook, every 60s"| DETECT
+    SAMP -.->|"periodic hook, every 60s: all 7 domain checks"| GDETECT
+    SAMP -.-> BDETECT
 
     BAT --> W1
     CPU --> W2
     MEM --> W3
     PROC --> W4
+    NET --> W5
+    DISK --> W6
+    THERM --> W7
 
-    DETECT -->|"query_stats() / query_earliest_timestamp()<br/>open_incident() / resolve_incident()"| STORE
+    BDETECT -->|"delegates to, configured with<br/>battery.discharge_watts, domain=battery"| GDETECT
+    GDETECT -->|"query_stats() / query_earliest_timestamp()<br/>open_incident() / resolve_incident()"| STORE
 
     STORE --> SQLITE
     STORE -.-> SAMPLE
@@ -517,7 +541,7 @@ flowchart TD
     subgraph PYPROC["A SEPARATE PROCESS: python -m intelligence.main"]
         TOOLS["tools.py: SysIntelClient<br/>the only way the agent touches the machine"]
         SCHEMAS["schemas.py<br/>Pydantic models incl. Reading[T], ActionOutcome"]
-        AGENT["agent.py: DiagnosticAgent(domain)<br/>one per battery/memory/cpu/network/disk<br/>TRIAGE -&gt; HYPOTHESES -&gt; EVIDENCE -&gt; (LLM or fallback) -&gt; EXPLAIN<br/>+ _build_suggested_action() (plain code, not the LLM; battery/cpu only)"]
+        AGENT["agent.py: DiagnosticAgent(domain)<br/>one per all 7 domains (Phase 10/11)<br/>TRIAGE -&gt; HYPOTHESES -&gt; EVIDENCE -&gt; (LLM or fallback) -&gt; EXPLAIN<br/>+ _maybe_action(): change_power_mode (battery/cpu/thermal)<br/>or suspend_process (top_cpu/memory, Phase 12/13) -- plain code, never the LLM"]
         LLM["llm.py: select_hypothesis()<br/>the ONLY thing that touches an LLM"]
         PYMAIN["main.py<br/>diagnose-&lt;domain&gt;: prints reasoned_by,<br/>asks 'Apply this now? [y/N]'"]
     end
@@ -525,21 +549,23 @@ flowchart TD
     GROQ[["Groq API<br/>(external service)"]]
 
     PYMAIN --> AGENT
-    AGENT -->|"get_<domain>_anomaly_status()<br/>get_system_snapshot()<br/>get_metric_history()<br/>get_recent_events()"| TOOLS
+    AGENT -->|"get_&lt;domain&gt;_anomaly_status()<br/>get_system_snapshot() / get_top_processes_by_cpu()<br/>get_metric_history() / get_recent_events()"| TOOLS
     TOOLS -.->|validates response into| SCHEMAS
-    TOOLS ==>|"subprocess: sysintel.exe status/history/check-&lt;domain&gt;/events --json<br/>(fixed subcommands + typed args, never a shell string)"| MAIN
+    TOOLS ==>|"subprocess: sysintel.exe status/history/check-&lt;domain&gt;/top-cpu/events --json<br/>(fixed subcommands + typed args, never a shell string)"| MAIN
 
     AGENT -->|"fixed hypothesis list + deterministically-gathered evidence only"| LLM
     LLM -->|"HTTPS, structured JSON response required"| GROQ
     LLM -.->|"LlmUnavailableError on failure"| AGENT
 
     PYMAIN -->|"only after y/N or --auto-approve"| TOOLS
-    TOOLS ==>|"subprocess: sysintel act change-power-mode --yes<br/>(same fixed action_type/params shape as the CLI)"| AB2["core/actions/action_broker.cpp<br/>(same broker as Phase 5's diagram)"]
+    TOOLS ==>|"subprocess: sysintel act change-power-mode --yes<br/>or sysintel act suspend-process &lt;pid&gt; --yes<br/>(same fixed action_type/params shape as the CLI)"| ABROKER
 ```
 
-Nothing here talks to Windows directly except the four `collectors/` files — everything else (`main.cpp`, `sampler.cpp`) just asks a collector for its snapshot. That separation is deliberate: later, the background service and the AI reasoning layer will call these exact same collector functions, and none of the collector code will need to change.
+Nothing here talks to Windows directly except the `collectors/` files — everything else (`main.cpp`, `sampler.cpp`) just asks a collector for its snapshot. That separation is deliberate: later, the background service and the AI reasoning layer will call these exact same collector functions, and none of the collector code will need to change.
 
-Notice the `python -m intelligence.main` box is a **separate process**, connected to everything above it by exactly one edge: `tools.py` calling `sysintel.exe` as a subprocess with fixed subcommands (`status`, `history`, `check-battery`) and typed arguments — never a free-form string handed to a shell. That's the whole point of the boundary: the reasoning layer can be wrong, slow, or (eventually) an actual LLM making mistakes, and none of that can turn into an arbitrary command against the machine. The real product will eventually replace this subprocess+JSON transport with the named-pipe IPC from the tech design, but the *tools* the agent calls won't need to change — only what's underneath them.
+`AnomalyDetector` and `battery_detector.cpp`'s relationship is worth tracing too: `battery_detector.cpp` isn't a second detection mechanism, it's a ~50-line wrapper that configures the same generic detector with `battery.discharge_watts`/`"battery"` and translates result names back to `BatteryCheckResult`'s battery-specific enum (Phase 7) — every other domain (`memory`/`cpu`/`network`/`disk`/`top_cpu`/`thermal`) talks to `AnomalyDetector` directly, with no per-domain wrapper needed since their result names were never battery-specific to begin with.
+
+Notice the `python -m intelligence.main` box is a **separate process**, connected to everything above it by exactly one edge: `tools.py` calling `sysintel.exe` as a subprocess with fixed subcommands (`status`, `history`, `check-<domain>`, `act`, ...) and typed arguments — never a free-form string handed to a shell. That's the whole point of the boundary: the reasoning layer can be wrong, slow, or (eventually) an actual LLM making mistakes, and none of that can turn into an arbitrary command against the machine. The real product will eventually replace this subprocess+JSON transport with the named-pipe IPC from the tech design, but the *tools* the agent calls won't need to change — only what's underneath them.
 
 The new `PYMAIN -> TOOLS -> action_broker.cpp` edge at the bottom is Phase 6's addition, and it's worth tracing carefully: it starts at `PYMAIN`, not `AGENT` or `LLM` — the approval prompt lives in `main.py`, gating the call before `tools.py` is ever invoked for it. `AGENT` never calls `TOOLS`' action methods itself; it only *returns* a `suggested_action` value for `PYMAIN` to look at. That's what keeps the LLM's blast radius exactly where it was in Phase 4: it can influence what gets *suggested* in prose, but the actual decision to invoke the broker, and the fixed shape of what gets sent to it, never passes through the model at all.
 
@@ -596,29 +622,35 @@ flowchart TD
     GPUM -.-> AVAIL
 ```
 
-### Phase 5's addition: the Action Broker
+### Phase 5's addition, generalized in Phase 12: the Action Broker
 
 ```mermaid
 flowchart TD
-    CLI4["sysintel act change-power-mode / rollback"]
+    CLI4["sysintel act change-power-mode / suspend-process / rollback"]
 
     subgraph BROKER["core/actions — the only path to a mutation"]
-        AB["action_broker.cpp: ActionBroker<br/>permission check -&gt; execute -&gt; verify -&gt; audit"]
+        AB["action_broker.cpp: ActionBroker<br/>execute(): permission check -&gt; dispatch by action_type<br/>-&gt; execute -&gt; verify -&gt; audit"]
         PS["power_scheme.cpp<br/>enumerate/get/set power schemes + Power Mode overlay"]
+        PC["process_control.cpp (Phase 12)<br/>suspend_process() / resume_process()"]
     end
 
     WINPOWER[["Windows PowrProf API<br/>PowerGetUserConfiguredDCPowerMode()<br/>PowerSetUserConfiguredDCPowerMode()"]]
+    WINPROC[["ntdll.dll (via GetProcAddress)<br/>NtSuspendProcess() / NtResumeProcess()"]]
 
     STORE4["SqliteStore<br/>record_action() / get_action()<br/>query_recent_actions() / mark_action_rolled_back()"]
 
     CLI4 -->|"approved: bool (--yes)"| AB
-    AB -->|"only recognized action_type: change_power_mode"| PS
+    AB -->|"action_type == change_power_mode"| PS
+    AB -->|"action_type == suspend_process<br/>(refuses a protected-name/pid denylist first,<br/>even with --yes)"| PC
     PS --> WINPOWER
+    PC --> WINPROC
     AB -->|"always logs, approved or not, success or not"| STORE4
-    AB -.->|"rollback restores the EXACT previous_state,<br/>not a re-derived 'opposite' value"| PS
+    AB -.->|"rollback(): dispatched by the RECORDED action_type"| DISPATCH{"which action_type?"}
+    DISPATCH -.->|"change_power_mode:<br/>restores the EXACT previous_state GUID"| PS
+    DISPATCH -.->|"suspend_process:<br/>resumes the EXACT pid recorded as previous_state"| PC
 ```
 
-Notice the broker is the only node with an edge into `power_scheme.cpp`'s write functions (`set_dc_power_mode*`) — nothing else in this codebase, including the Python agent, can reach them. And notice `CLI4 -> AB` carries `approved` as an explicit boolean the *caller* controls (today, a `--yes` flag; later, a UI approval dialog) — the broker itself never decides to skip approval.
+Notice the broker is the only node with an edge into `power_scheme.cpp`'s write functions and `process_control.cpp`'s suspend/resume calls — nothing else in this codebase, including the Python agent, can reach them. `CLI4 -> AB` carries `approved` as an explicit boolean the *caller* controls (today, a `--yes` flag; later, a UI approval dialog) — the broker itself never decides to skip approval. And `rollback()`'s dispatch (Phase 12) is deliberately separate from `execute()`'s: "undo the previous state" means restoring a GUID for one action type and resuming a pid for the other, so there's no single generic "opposite" operation to fall back to.
 
 ## What each file does, in easy words
 
