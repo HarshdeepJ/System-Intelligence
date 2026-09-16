@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from . import llm
-from .schemas import BatteryCheckReport, Incident, ProcessCpuInfo
+from .schemas import BatteryCheckReport, Incident
 from .tools import SysIntelClient
 
 
@@ -175,10 +175,12 @@ class _DomainConfig:
     # memory leak or elevated network/disk I/O -- offering it there would overstate what
     # this agent can actually do. Mutually exclusive with offers_suspend_action below.
     action_reason_label: Optional[str]
-    # True only for top_cpu: unlike every other domain, this one's evidence identifies an
-    # actual culprit process (the single busiest one, queried fresh at suggestion time via
-    # get_top_processes_by_cpu()), so it gets the more targeted suspend_process action
-    # instead of the general change_power_mode lever.
+    # True for domains whose evidence identifies an actual culprit process -- top_cpu
+    # (the single busiest process, via get_top_processes_by_cpu()) and memory (the
+    # largest working set, via the snapshot's top_processes_by_memory) -- so they get
+    # the more targeted suspend_process action instead of the general change_power_mode
+    # lever. network/disk don't offer it: neither has a per-process breakdown collector,
+    # only a system-wide total.
     offers_suspend_action: bool = False
 
 
@@ -209,6 +211,10 @@ _DOMAINS: dict[str, _DomainConfig] = {
         hypotheses=_RESOURCE_HYPOTHESES,
         cpu_workload_hypothesis_id="H1",
         action_reason_label=None,
+        # Unlike network/disk, memory already has a per-process breakdown
+        # this agent can query (get_system_snapshot().top_processes_by_memory
+        # -- no new collector needed), so it gets the targeted action too.
+        offers_suspend_action=True,
     ),
     "network": _DomainConfig(
         check_method="get_network_anomaly_status",
@@ -287,18 +293,25 @@ _PROTECTED_PROCESS_NAMES = {
 }
 
 
-def _build_suspend_action(proc: ProcessCpuInfo) -> SuggestedAction:
+@dataclass(frozen=True)
+class _SuspendCandidate:
+    pid: int
+    name: str
+    detail: str  # e.g. "at 95.0% CPU" or "using 512 MB" -- the domain-specific reading
+
+
+def _build_suspend_action(candidate: _SuspendCandidate) -> SuggestedAction:
     """The targeted second action: pause the specific process that's
-    actually monopolizing the CPU, rather than the blunter system-wide
-    power-mode lever. Suspend, never terminate -- resumable exactly as it
-    was via rollback_action(), so this stays a safe, reversible action even
-    though it's aimed at one process instead of the whole machine."""
+    actually responsible, rather than the blunter system-wide power-mode
+    lever. Suspend, never terminate -- resumable exactly as it was via
+    rollback_action(), so this stays a safe, reversible action even though
+    it's aimed at one process instead of the whole machine."""
     return SuggestedAction(
         action_type="suspend_process",
-        params={"pid": str(proc.pid)},
-        reason=f"runaway process CPU load: {proc.name} (pid {proc.pid}) at {proc.cpu_percent:.1f}%",
+        params={"pid": str(candidate.pid)},
+        reason=f"runaway resource usage: {candidate.name} (pid {candidate.pid}) {candidate.detail}",
         description=(
-            f"Suspend '{proc.name}' (pid {proc.pid}) -- pauses it without closing it; "
+            f"Suspend '{candidate.name}' (pid {candidate.pid}) -- pauses it without closing it; "
             "resume anytime with the action's rollback"
         ),
     )
@@ -313,22 +326,39 @@ class DiagnosticAgent:
         self.min_history_days = min_history_days
         self._config = _DOMAINS[domain]
 
+    def _pick_suspend_candidate(self) -> _SuspendCandidate | None:
+        """Queried fresh, not from the evidence already gathered: by the time
+        a diagnosis reaches this point the LLM call may have taken several
+        seconds, so "who's the top process right now" is a more honest
+        target to suspend than "who was the top process when evidence was
+        collected." Looks past a few candidates, not just the first, since
+        the single busiest process is quite often something protected (e.g.
+        "System" or "Memory Compression") -- skip those rather than suggest
+        something guaranteed to fail."""
+        if self.domain == "top_cpu":
+            for proc in self.tools.get_top_processes_by_cpu(limit=5):
+                if proc.name.lower() not in _PROTECTED_PROCESS_NAMES:
+                    return _SuspendCandidate(
+                        pid=proc.pid, name=proc.name, detail=f"at {proc.cpu_percent:.1f}% CPU"
+                    )
+            return None
+
+        if self.domain == "memory":
+            snapshot = self.tools.get_system_snapshot()
+            for proc in snapshot.top_processes_by_memory:
+                if proc.name.lower() not in _PROTECTED_PROCESS_NAMES:
+                    mb = proc.working_set_bytes / 1024 / 1024
+                    return _SuspendCandidate(
+                        pid=proc.pid, name=proc.name, detail=f"using {mb:.0f} MB"
+                    )
+            return None
+
+        return None
+
     def _maybe_action(self, norm: _NormalizedCheck) -> SuggestedAction | None:
         if self._config.offers_suspend_action:
-            # Queried fresh, not from the evidence already gathered: by the
-            # time a diagnosis reaches this point the LLM call may have taken
-            # several seconds, so "who's the top process right now" is a more
-            # honest target to suspend than "who was the top process when
-            # evidence was collected." Asks for a few candidates, not just
-            # one, since the single busiest process is quite often something
-            # like "System" or "Memory Compression" that's protected and
-            # would just be refused -- skip those rather than suggest
-            # something guaranteed to fail.
-            candidates = self.tools.get_top_processes_by_cpu(limit=5)
-            for proc in candidates:
-                if proc.name.lower() not in _PROTECTED_PROCESS_NAMES:
-                    return _build_suspend_action(proc)
-            return None
+            candidate = self._pick_suspend_candidate()
+            return _build_suspend_action(candidate) if candidate else None
         if self._config.action_reason_label is None:
             return None
         return _build_suggested_action(
