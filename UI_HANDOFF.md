@@ -36,7 +36,7 @@ SQLite database, Python agent, or LLM behind it.
 - Use WPF for the native UI. This deliberately replaces the PRD's WinUI 3
   choice because WPF provides transparent layered windows with much less setup.
 - The halo lives at the top-center screen edge.
-- It starts tucked above the screen, leaving a faint two-pixel glint. It appears
+- It starts fully tucked above the screen with no persistent glint. It appears
   only after the pointer remains inside an 84-by-6-logical-pixel activation
   strip at the top center for 180 ms.
 - Once visible, the halo stays while hovered or while its card/context menu is
@@ -83,8 +83,9 @@ Current behavior:
 - Continuous restrained breathing, core shimmer, and a slowly drifting wisp.
 - Animated calm, listening, working, warm, worried, sleepy,
   happy/charging, and offline color profiles.
-- Left-click toggles a 68-pixel-high horizontal health strip: compact status at
-  left, followed by CPU, memory, temperature, battery, and disk on one row.
+- Left-click toggles a 48-pixel-high translucent health strip: compact status
+  at left, followed by CPU, memory, temperature, battery, and disk on one row.
+  There are no health ticks, dividers, shadows, or telemetry footer.
 - Right-click opens chat/voice controls, previews system states, and provides
   **Quit System Intelligence**
   (previewing a state sets a `_previewActive` flag that pauses telemetry-driven
@@ -182,7 +183,7 @@ Verification modes:
 .\ui\PixelMini\bin\PixelMini.exe --visual-check
 ```
 
-`--smoke-layout` verifies top-center edge gating and the idle-glint → reveal →
+`--smoke-layout` verifies top-center edge gating and the fully-hidden → reveal →
 expanded-card sequence, including horizontal centering after a resize.
 
 `--visual-check` renders a 3× preview to
@@ -247,7 +248,10 @@ centered command bar just below the top edge. Typed input submits with Enter or
 the arrow button. During voice capture, SAPI hypothesis events stream the
 current transcription into that same field, so speech visibly forms as text.
 On submission the composer lifts and fades upward; once the answer is ready,
-only the response surface fades into view. Conversation history is still kept
+the response surface fades into view and a minimal follow-up field appears
+beneath it with keyboard focus already restored. The empty field fades away
+after five seconds without typing or voice input; the response remains visible.
+Any entered text cancels that inactivity timer. Conversation history is kept
 for the session (so "and what about the CPU?" correctly reads as a follow-up
 to a prior memory question). Voice wake opens the same bar. Opening chat closes
 the health card/ambient bubble and vice versa; an open chat also suppresses the

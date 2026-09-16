@@ -23,7 +23,8 @@ dotnet run --project .\ui\PixelMini\PixelMini.csproj
 
 ## Presence and interaction
 
-- At rest, only a faint two-pixel glint remains at the top center.
+- At rest, the halo is completely hidden; the top-center activation zone stays
+  active without leaving a line on screen.
 - Hold the pointer in the top-center activation strip for 180 ms to reveal the
   halo. The strip is 84 logical pixels wide and six pixels tall.
 - The visible halo breathes continuously, with a soft bloom, bright core, and
@@ -37,7 +38,10 @@ dotnet run --project .\ui\PixelMini\PixelMini.csproj
   screen, control voice listening, preview system states, or quit. Typed input
   submits with Enter or the arrow button. Voice recognition streams its current
   transcription into the same bar. On submit, the prompt lifts away and the
-  finished response appears alone on a compact glass surface.
+  response appears on a compact glass surface. A minimal follow-up field then
+  fades in beneath it and receives keyboard focus automatically, so the next
+  turn needs no click. An empty composer fades away after five seconds of no
+  typing or speech; an existing answer remains visible.
 - The halo retreats after ten seconds away, unless a card, chat, or menu is
   open.
 

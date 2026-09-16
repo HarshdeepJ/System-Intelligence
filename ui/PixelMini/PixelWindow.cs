@@ -32,8 +32,8 @@ internal sealed class PixelWindow : Window
     private const double CompactHeight = 72;
     private const double BubbleWidth = 320;
     private const double BubbleHeight = 162;
-    private const double ExpandedWidth = 700;
-    private const double ExpandedHeight = 148;
+    private const double ExpandedWidth = 540;
+    private const double ExpandedHeight = 112;
     private const double ChatWidth = 560;
     private const double ChatHeight = 330;
     private static readonly TimeSpan PeekAfter = TimeSpan.FromSeconds(10);
@@ -99,12 +99,12 @@ internal sealed class PixelWindow : Window
     private readonly Border _chatComposer;
     private readonly Border _chatResultSurface;
     private readonly TextBlock _chatHint;
+    private readonly DispatcherTimer _chatIdleTimer;
     private bool _chatOpen;
     private bool _chatBusy;
     private readonly VoiceAssistant _voice = new();
     private bool _voiceEnabled;
     private TextBlock _cardSubtitleText = null!;
-    private TextBlock _cardFootnoteText = null!;
     private HealthMetricRow _cpuMetric = null!;
     private HealthMetricRow _memoryMetric = null!;
     private HealthMetricRow _tempMetric = null!;
@@ -148,6 +148,8 @@ internal sealed class PixelWindow : Window
         _dbPath = repoRoot is not null ? System.IO.Path.Combine(repoRoot, "sysintel.db") : "sysintel.db";
         (_chatPanel, _chatMessages, _chatScroll, _chatInput, _chatComposer, _chatResultSurface, _chatHint) = BuildChatPanel();
         _chatIcon = BuildChatIcon();
+        _chatIdleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _chatIdleTimer.Tick += (_, _) => HideIdleChatComposer();
 
         _root.Children.Add(_bubble);
         _root.Children.Add(_healthCard);
@@ -221,10 +223,6 @@ internal sealed class PixelWindow : Window
             _networkTimer.Start();
             _ = PollNetworkAsync();
         }
-        else if (!_layoutSmokeTest)
-        {
-            _cardFootnoteText.Text = "sysintel.exe not found — showing preview values";
-        }
 
         _voice.WakeWordDetected += OnVoiceWakeWordDetected;
         _voice.TranscriptionChanged += OnVoiceTranscriptionChanged;
@@ -236,6 +234,7 @@ internal sealed class PixelWindow : Window
             _cursorTimer.Stop();
             _blinkTimer.Stop();
             _bubbleTimer.Stop();
+            _chatIdleTimer.Stop();
             _telemetryTimer?.Stop();
             _networkTimer?.Stop();
             _voice.Stop();
@@ -286,6 +285,7 @@ internal sealed class PixelWindow : Window
         {
             ApplyExpression(ExpressionKind.Calm, true);
         }
+        RestartChatIdleTimer();
     }));
 
     private void ToggleVoice(MenuItem menuItem)
@@ -332,8 +332,6 @@ internal sealed class PixelWindow : Window
 
             var decision = _arbiter.Evaluate(_snapshot, DateTime.UtcNow);
             UpdateHealthCard(_snapshot, decision.Subtitle);
-            _cardFootnoteText.Text = "Live telemetry";
-
             if (!_previewActive)
             {
                 ApplyExpression(decision.Expression, true);
@@ -625,16 +623,9 @@ internal sealed class PixelWindow : Window
             MinHeight = 72,
             Padding = new Thickness(18, 14, 18, 14),
             CornerRadius = new CornerRadius(22, 22, 6, 22),
-            Background = new SolidColorBrush(Color.FromArgb(247, 251, 253, 255)),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(80, 151, 178, 235)),
+            Background = new SolidColorBrush(Color.FromArgb(182, 251, 253, 255)),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(48, 151, 178, 235)),
             BorderThickness = new Thickness(1),
-            Effect = new System.Windows.Media.Effects.DropShadowEffect
-            {
-                BlurRadius = 18,
-                ShadowDepth = 5,
-                Opacity = 0.17,
-                Color = Color.FromRgb(42, 63, 112)
-            },
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Top,
             Margin = new Thickness(0, 54, 0, 0),
@@ -646,29 +637,19 @@ internal sealed class PixelWindow : Window
     {
         var status = new StackPanel
         {
-            Width = 165,
+            Width = 135,
             VerticalAlignment = VerticalAlignment.Center
         };
         _cardSubtitleText = new TextBlock
         {
             Text = "Everything feels good.",
             FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI"),
-            FontSize = 13,
+            FontSize = 12,
             FontWeight = FontWeights.SemiBold,
             Foreground = new SolidColorBrush(Ink),
             TextTrimming = TextTrimming.CharacterEllipsis
         };
         status.Children.Add(_cardSubtitleText);
-
-        _cardFootnoteText = new TextBlock
-        {
-            Text = "Connecting…",
-            Margin = new Thickness(0, 3, 0, 0),
-            FontSize = 10,
-            Foreground = new SolidColorBrush(Color.FromRgb(122, 133, 162)),
-            TextTrimming = TextTrimming.CharacterEllipsis
-        };
-        status.Children.Add(_cardFootnoteText);
 
         _cpuMetric = BuildMetric("CPU", "—");
         _memoryMetric = BuildMetric("MEM", "—");
@@ -687,37 +668,27 @@ internal sealed class PixelWindow : Window
         metrics.Children.Add(_batteryMetric.Element);
         metrics.Children.Add(_diskMetric.Element);
 
-        var divider = new Border
-        {
-            Width = 1,
-            Height = 30,
-            Margin = new Thickness(14, 0, 10, 0),
-            Background = new SolidColorBrush(Color.FromArgb(54, 124, 143, 190)),
-            VerticalAlignment = VerticalAlignment.Center
-        };
-
         var row = new StackPanel
         {
             Orientation = Orientation.Horizontal,
             VerticalAlignment = VerticalAlignment.Center
         };
         row.Children.Add(status);
-        row.Children.Add(divider);
         row.Children.Add(metrics);
 
         return new Border
         {
             Visibility = Visibility.Collapsed,
-            Width = 660,
-            Height = 68,
-            Padding = new Thickness(18, 8, 14, 8),
-            CornerRadius = new CornerRadius(24),
-            Background = new SolidColorBrush(Color.FromArgb(239, 251, 253, 255)),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(70, 153, 178, 230)),
+            Width = 510,
+            Height = 48,
+            Padding = new Thickness(14, 5, 10, 5),
+            CornerRadius = new CornerRadius(18),
+            Background = new SolidColorBrush(Color.FromArgb(168, 251, 253, 255)),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(44, 153, 178, 230)),
             BorderThickness = new Thickness(1),
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Top,
-            Margin = new Thickness(0, 54, 0, 0),
+            Margin = new Thickness(0, 50, 0, 0),
             Child = row
         };
     }
@@ -727,12 +698,11 @@ internal sealed class PixelWindow : Window
         var grid = new Grid();
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(15) });
 
         var name = new TextBlock
         {
             Text = label,
-            FontSize = 9.5,
+            FontSize = 9,
             FontWeight = FontWeights.SemiBold,
             Foreground = new SolidColorBrush(Color.FromRgb(103, 115, 148)),
             VerticalAlignment = VerticalAlignment.Center,
@@ -741,36 +711,24 @@ internal sealed class PixelWindow : Window
         var reading = new TextBlock
         {
             Text = value,
-            FontSize = 12.5,
+            FontSize = 12,
             FontWeight = FontWeights.SemiBold,
             Foreground = new SolidColorBrush(Ink),
             VerticalAlignment = VerticalAlignment.Center
         };
-        var check = new TextBlock
-        {
-            Text = "—",
-            FontSize = 11,
-            FontWeight = FontWeights.Bold,
-            Foreground = new SolidColorBrush(Color.FromRgb(163, 173, 199)),
-            HorizontalAlignment = HorizontalAlignment.Right,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-
         Grid.SetColumn(name, 0);
         Grid.SetColumn(reading, 1);
-        Grid.SetColumn(check, 2);
         grid.Children.Add(name);
         grid.Children.Add(reading);
-        grid.Children.Add(check);
 
         var element = new Border
         {
-            Width = 84,
+            Width = 70,
             Background = Brushes.Transparent,
-            Padding = new Thickness(7, 5, 3, 5),
+            Padding = new Thickness(5, 4, 2, 4),
             Child = grid
         };
-        return new HealthMetricRow(element, reading, check);
+        return new HealthMetricRow(element, reading);
     }
 
     private ContextMenu BuildContextMenu()
@@ -878,9 +836,13 @@ internal sealed class PixelWindow : Window
             IsHitTestVisible = false,
             VerticalAlignment = VerticalAlignment.Center
         };
-        input.TextChanged += (_, _) => hint.Visibility = input.Text.Length == 0
-            ? Visibility.Visible
-            : Visibility.Collapsed;
+        input.TextChanged += (_, _) =>
+        {
+            hint.Visibility = input.Text.Length == 0
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+            HandleChatInputActivity(input.Text);
+        };
         input.PreviewKeyDown += (_, e) =>
         {
             if (e.Key == Key.Enter)
@@ -930,17 +892,17 @@ internal sealed class PixelWindow : Window
         composerGrid.Children.Add(send);
 
         var glass = new LinearGradientBrush { StartPoint = new Point(0, 0), EndPoint = new Point(1, 1) };
-        glass.GradientStops.Add(new GradientStop(Color.FromArgb(241, 255, 255, 255), 0));
-        glass.GradientStops.Add(new GradientStop(Color.FromArgb(226, 242, 247, 255), 0.55));
-        glass.GradientStops.Add(new GradientStop(Color.FromArgb(238, 251, 248, 255), 1));
+        glass.GradientStops.Add(new GradientStop(Color.FromArgb(184, 255, 255, 255), 0));
+        glass.GradientStops.Add(new GradientStop(Color.FromArgb(158, 242, 247, 255), 0.55));
+        glass.GradientStops.Add(new GradientStop(Color.FromArgb(176, 251, 248, 255), 1));
 
         var composer = new Border
         {
-            Height = 58,
-            Padding = new Thickness(22, 0, 14, 0),
-            CornerRadius = new CornerRadius(29),
+            Height = 48,
+            Padding = new Thickness(20, 0, 12, 0),
+            CornerRadius = new CornerRadius(24),
             Background = glass,
-            BorderBrush = new SolidColorBrush(Color.FromArgb(105, 167, 196, 255)),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(48, 167, 196, 255)),
             BorderThickness = new Thickness(1),
             RenderTransform = new TranslateTransform(),
             Child = composerGrid
@@ -959,19 +921,19 @@ internal sealed class PixelWindow : Window
         var resultSurface = new Border
         {
             Visibility = Visibility.Collapsed,
-            Margin = new Thickness(10, 10, 10, 0),
+            Margin = new Thickness(10, 0, 10, 8),
             Padding = new Thickness(20, 17, 16, 17),
             CornerRadius = new CornerRadius(20),
-            Background = new SolidColorBrush(Color.FromArgb(239, 251, 253, 255)),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(82, 164, 196, 255)),
+            Background = new SolidColorBrush(Color.FromArgb(176, 251, 253, 255)),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(44, 164, 196, 255)),
             BorderThickness = new Thickness(1),
             RenderTransform = new TranslateTransform(0, -8),
             Child = resultGrid
         };
 
         var stack = new StackPanel();
-        stack.Children.Add(composer);
         stack.Children.Add(resultSurface);
+        stack.Children.Add(composer);
 
         var panel = new Border
         {
@@ -1051,10 +1013,12 @@ internal sealed class PixelWindow : Window
             ? "Ask your computer…"
             : "Ask a question — limited reasoning is available";
         _chatInput.Focus();
+        RestartChatIdleTimer();
     }
 
     private void CloseChatPanel()
     {
+        _chatIdleTimer.Stop();
         _chatOpen = false;
         _chatPanel.Visibility = Visibility.Collapsed;
         _chatIcon.Visibility = Visibility.Visible;
@@ -1071,6 +1035,7 @@ internal sealed class PixelWindow : Window
         }
 
         _chatHistory.Add(new ChatTurn(true, question));
+        _chatIdleTimer.Stop();
         _chatMessages.Children.Clear();
         _chatResultSurface.Visibility = Visibility.Collapsed;
         _chatInput.IsEnabled = false;
@@ -1100,10 +1065,14 @@ internal sealed class PixelWindow : Window
             _chatBusy = false;
             _chatInput.IsEnabled = true;
             _chatInput.Text = string.Empty;
-            _chatHint.Text = "Ask your computer…";
+            _chatHint.Text = "Ask a follow-up…";
             if (!_previewActive)
             {
                 ApplyExpression(ExpressionKind.Calm, true);
+            }
+            if (_chatOpen)
+            {
+                ShowFollowUpComposer();
             }
             ScrollChatToEnd();
         }
@@ -1146,6 +1115,94 @@ internal sealed class PixelWindow : Window
             offset.BeginAnimation(TranslateTransform.YProperty,
                 new DoubleAnimation(-8, 0, duration) { EasingFunction = easing });
         }
+    }
+
+    private void ShowFollowUpComposer()
+    {
+        _chatComposer.BeginAnimation(OpacityProperty, null);
+        _chatComposer.Visibility = Visibility.Visible;
+        _chatComposer.Opacity = 0;
+
+        var offset = _chatComposer.RenderTransform as TranslateTransform;
+        if (offset is not null)
+        {
+            offset.BeginAnimation(TranslateTransform.YProperty, null);
+            offset.Y = 6;
+        }
+
+        var delay = TimeSpan.FromMilliseconds(150);
+        var duration = TimeSpan.FromMilliseconds(240);
+        var easing = new CubicEase { EasingMode = EasingMode.EaseOut };
+        _chatComposer.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, duration)
+        {
+            BeginTime = delay,
+            EasingFunction = easing
+        });
+        if (offset is not null)
+        {
+            offset.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(6, 0, duration)
+            {
+                BeginTime = delay,
+                EasingFunction = easing
+            });
+        }
+
+        _chatInput.Focus();
+        Keyboard.Focus(_chatInput);
+        RestartChatIdleTimer();
+    }
+
+    private void HandleChatInputActivity(string text)
+    {
+        if (!_chatOpen || _chatBusy)
+        {
+            return;
+        }
+
+        if (text.Length > 0)
+        {
+            _chatIdleTimer.Stop();
+            _chatComposer.BeginAnimation(OpacityProperty, null);
+            _chatComposer.Visibility = Visibility.Visible;
+            _chatComposer.Opacity = 1;
+            return;
+        }
+
+        RestartChatIdleTimer();
+    }
+
+    private void RestartChatIdleTimer()
+    {
+        _chatIdleTimer.Stop();
+        if (_chatOpen && !_chatBusy && _chatInput.Text.Length == 0 && !_voice.IsListeningForQuestion)
+        {
+            _chatIdleTimer.Start();
+        }
+    }
+
+    private void HideIdleChatComposer()
+    {
+        _chatIdleTimer.Stop();
+        if (!_chatOpen || _chatBusy || _chatInput.Text.Length > 0 || _voice.IsListeningForQuestion)
+        {
+            return;
+        }
+
+        var fade = new DoubleAnimation(_chatComposer.Opacity, 0, TimeSpan.FromMilliseconds(200))
+        {
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut }
+        };
+        fade.Completed += (_, _) =>
+        {
+            _chatComposer.Visibility = Visibility.Collapsed;
+            _chatComposer.BeginAnimation(OpacityProperty, null);
+            _chatComposer.Opacity = 1;
+            if (_chatResultSurface.Visibility != Visibility.Visible)
+            {
+                CloseChatPanel();
+            }
+        };
+        _chatComposer.BeginAnimation(OpacityProperty, fade);
     }
 
     private void ScrollChatToEnd() => _chatScroll.ScrollToEnd();
@@ -1698,7 +1755,7 @@ internal sealed class PixelWindow : Window
 
     private static double PeekTop()
     {
-        return -CompactHeight + 2;
+        return -CompactHeight;
     }
 
     private static double Clamp(double value, double minimum, double maximum)
@@ -1741,33 +1798,29 @@ internal sealed class PixelWindow : Window
 
     private sealed class HealthMetricRow
     {
-        private static readonly SolidColorBrush HealthyBrush = new(Color.FromRgb(59, 183, 149));
+        private static readonly SolidColorBrush NormalBrush = new(Ink);
         private static readonly SolidColorBrush AttentionBrush = new(Color.FromRgb(224, 105, 92));
         private static readonly SolidColorBrush UnknownBrush = new(Color.FromRgb(163, 173, 199));
 
-        public HealthMetricRow(Border element, TextBlock valueText, TextBlock statusGlyph)
+        public HealthMetricRow(Border element, TextBlock valueText)
         {
             Element = element;
             ValueText = valueText;
-            StatusGlyph = statusGlyph;
         }
 
         public Border Element { get; }
         private TextBlock ValueText { get; }
-        private TextBlock StatusGlyph { get; }
 
         public void Update(string value, bool healthy)
         {
             ValueText.Text = value;
-            StatusGlyph.Text = healthy ? "✓" : "!";
-            StatusGlyph.Foreground = healthy ? HealthyBrush : AttentionBrush;
+            ValueText.Foreground = healthy ? NormalBrush : AttentionBrush;
         }
 
         public void UpdateUnknown(string placeholder = "—")
         {
             ValueText.Text = placeholder;
-            StatusGlyph.Text = "—";
-            StatusGlyph.Foreground = UnknownBrush;
+            ValueText.Foreground = UnknownBrush;
         }
     }
 
