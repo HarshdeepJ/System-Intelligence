@@ -86,7 +86,9 @@ Watching battery/CPU/memory/network/disk (recording + anomaly checks) -- Ctrl+C 
 Anomaly baseline requires 14 day(s) of accumulated history.
 ```
 
-Not yet done: the Python diagnostic agent still can't see network or disk (`get_battery_anomaly_status()` is still the only anomaly-status tool); generalizing the agent itself beyond battery — for any domain — remains the next slice.
+`SysIntelClient` (`intelligence/tools.py`) now has a matching tool for every domain the CLI can check: `get_memory_anomaly_status()`, `get_cpu_anomaly_status()`, `get_network_anomaly_status()`, `get_disk_anomaly_status()`, all sharing one generic `AnomalyCheckReport` schema (`intelligence/schemas.py`) and one private `_get_anomaly_status(command, min_history_days)` helper, since all four call the same `check-<domain> --db --min-history-days --json` shape and get back the same JSON fields (`result`/`live_mean`/`baseline_mean`/`baseline_stddev`/`threshold`/`incident`). `get_battery_anomaly_status()` stays separate rather than joining that helper -- its JSON has renamed `*_watts` fields and a battery-specific result name (`no_recent_discharge` instead of `no_recent_samples`), a real shape difference, not just a naming one.
+
+Not yet done: nothing in `agent.py` calls these four new tools yet -- `BatteryDiagnosticAgent` still only investigates battery incidents. The tools exist so the agent *can* see every domain; generalizing the diagnosis loop itself to use them remains the next slice.
 
 ### Phase 7: one detector, three domains — the start of "diagnose everything"
 

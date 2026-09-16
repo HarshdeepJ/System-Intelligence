@@ -15,7 +15,14 @@ import subprocess
 from pathlib import Path
 from typing import Union
 
-from .schemas import ActionOutcome, BatteryCheckReport, EventsResult, MetricHistory, SystemSnapshot
+from .schemas import (
+    ActionOutcome,
+    AnomalyCheckReport,
+    BatteryCheckReport,
+    EventsResult,
+    MetricHistory,
+    SystemSnapshot,
+)
 
 
 class SysIntelToolError(RuntimeError):
@@ -71,6 +78,30 @@ class SysIntelClient:
                 "--json",
             )
         )
+
+    def _get_anomaly_status(self, command: str, min_history_days: int) -> AnomalyCheckReport:
+        return AnomalyCheckReport.model_validate(
+            self._run(
+                command,
+                "--db",
+                self._db,
+                "--min-history-days",
+                str(min_history_days),
+                "--json",
+            )
+        )
+
+    def get_memory_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
+        return self._get_anomaly_status("check-memory", min_history_days)
+
+    def get_cpu_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
+        return self._get_anomaly_status("check-cpu", min_history_days)
+
+    def get_network_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
+        return self._get_anomaly_status("check-network", min_history_days)
+
+    def get_disk_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
+        return self._get_anomaly_status("check-disk", min_history_days)
 
     def get_recent_events(self, last_minutes: int = 60, limit: int = 50) -> EventsResult:
         return EventsResult.model_validate(

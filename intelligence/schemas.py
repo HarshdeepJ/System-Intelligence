@@ -107,6 +107,30 @@ class BatteryCheckReport(BaseModel):
     incident: Optional[Incident] = None
 
 
+AnomalyCheckResultName = Literal[
+    "not_enough_history",
+    "no_recent_samples",
+    "normal",
+    "anomaly_opened",
+    "anomaly_ongoing",
+    "resolved",
+]
+
+
+class AnomalyCheckReport(BaseModel):
+    """Mirrors json_generic_check_report() in main.cpp -- the shape shared by
+    check-memory/check-cpu/check-network/check-disk (every domain that
+    doesn't need BatteryCheckReport's renamed *_watts fields and
+    battery-specific result names)."""
+
+    result: AnomalyCheckResultName
+    live_mean: float
+    baseline_mean: float
+    baseline_stddev: float
+    threshold: float
+    incident: Optional[Incident] = None
+
+
 class SystemEvent(BaseModel):
     timestamp_ms: int
     type: str
