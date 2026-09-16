@@ -28,10 +28,10 @@ This repo now spans two runtimes:
 - `sysintel thermal` — CPU thermal zone temperature and fan RPM, best-effort (Phase 8)
 - every command above also takes `--json` for machine-readable output
 
-**A Python reasoning agent** (`intelligence/`, Phase 4 — real LLM reasoning via Groq, Phase 6 closes the loop into an actual action):
-- `diagnose-battery [--auto-approve] [--no-act]` — investigates an open battery incident: collects evidence via the CLI's `--json` output, sends it to an LLM for hypothesis selection, prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format, and — unless `--no-act` — offers a concrete, runnable action with an interactive approval prompt (or applies it automatically with `--auto-approve`)
+**A Python reasoning agent** (`intelligence/`, Phase 4 — real LLM reasoning via Groq, Phase 6 closes the loop into an actual action, Phase 10 generalizes it beyond battery):
+- `diagnose-battery` / `diagnose-memory` / `diagnose-cpu` / `diagnose-network` / `diagnose-disk` `[--auto-approve] [--no-act]` — investigates an open anomaly in that domain: collects evidence via the CLI's `--json` output, sends it to an LLM for hypothesis selection, prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format, and — for battery/cpu, unless `--no-act` — offers a concrete, runnable action with an interactive approval prompt (or applies it automatically with `--auto-approve`)
 
-Everything else (the native UI, AMD/Intel GPU telemetry, and the Python agent generalizing beyond battery) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
+Everything else (the native UI and AMD/Intel GPU telemetry) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
 
 ### Phase 8: the missing collectors — network, disk I/O, per-process CPU, thermal/fan
 
@@ -88,7 +88,38 @@ Anomaly baseline requires 14 day(s) of accumulated history.
 
 `SysIntelClient` (`intelligence/tools.py`) now has a matching tool for every domain the CLI can check: `get_memory_anomaly_status()`, `get_cpu_anomaly_status()`, `get_network_anomaly_status()`, `get_disk_anomaly_status()`, all sharing one generic `AnomalyCheckReport` schema (`intelligence/schemas.py`) and one private `_get_anomaly_status(command, min_history_days)` helper, since all four call the same `check-<domain> --db --min-history-days --json` shape and get back the same JSON fields (`result`/`live_mean`/`baseline_mean`/`baseline_stddev`/`threshold`/`incident`). `get_battery_anomaly_status()` stays separate rather than joining that helper -- its JSON has renamed `*_watts` fields and a battery-specific result name (`no_recent_discharge` instead of `no_recent_samples`), a real shape difference, not just a naming one.
 
-Not yet done: nothing in `agent.py` calls these four new tools yet -- `BatteryDiagnosticAgent` still only investigates battery incidents. The tools exist so the agent *can* see every domain; generalizing the diagnosis loop itself to use them remains the next slice.
+Not yet done (as of Phase 9): nothing in `agent.py` calls these four new tools yet -- `BatteryDiagnosticAgent` still only investigates battery incidents. Phase 10 closes that gap.
+
+### Phase 10: one diagnosis engine, five domains
+
+The battery-only diagnosis loop (Phase 6) had nothing battery-specific about its *state machine* -- triage, gather deterministic evidence, hand fixed hypotheses to an LLM, fall back to a rule if the LLM is unreachable -- except which check-* tool it called and how it phrased the headline evidence line. `agent.py`'s `BatteryDiagnosticAgent` is now a thin, name-preserving subclass of a new `DiagnosticAgent(tools, domain, min_history_days)` that the same loop runs for `"battery"`, `"memory"`, `"cpu"`, `"network"`, or `"disk"` -- the same "pull it out once there's a second real case to prove the abstraction against" move Phase 7 made for `AnomalyDetector`.
+
+The one place this couldn't just be mechanical: hypotheses. Battery's original three ("system-wide CPU workload", "GPU activity", "unexplained") don't all transplant cleanly -- offering "system-wide CPU workload is responsible" as an explanation for a *CPU* anomaly is circular, not a hypothesis. So the cpu domain gets its own set (GPU-correlated load, a recently-started process, unexplained), and memory/network/disk share a third set built from the two general-purpose correlates this agent can actually check (CPU workload, a recently-started process) plus honest uncertainty. A small `_DomainConfig` per domain also records which hypothesis ID means "CPU workload correlates" (`None` for cpu itself) so the rule-based fallback doesn't have to know each domain's hypothesis wording, and whether the domain offers a suggested action at all.
+
+That last point is deliberate, not an oversight: the Action Broker's only capability (`change_power_mode`) is a real lever on CPU/GPU power draw, so it's offered for battery and cpu anomalies, exactly as before. Offering it for a memory leak or an elevated network/disk transfer would overstate what this agent can actually fix, so those three domains diagnose but never suggest an action -- `--no-act`'s behavior for them, always.
+
+`BatteryCheckReport` (renamed `*_watts` fields, battery-specific result names) and the generic `AnomalyCheckReport` from Phase 9 still aren't the same shape; `_normalize_check()` is the one place that difference gets flattened into a shared internal type so the rest of the agent never has to care which one it got.
+
+```text
+$ intelligence diagnose-network --min-history-days 1 --no-act
+[reasoned by: rule-based fallback]
+
+Finding
+  System-wide CPU workload is correlated with the anomaly
+
+Confidence: 70%
+
+Evidence
+  - network throughput: 500000.0 B/s observed vs 14770.79 B/s baseline (threshold 187015.97 B/s)
+  - CPU utilization: 80.0% now vs 16.3% (24h average)
+
+Recommended action
+  Investigate which process is driving CPU usage; consider closing it or switching to a lower power plan.
+```
+
+Verified against seeded synthetic anomalies for cpu, battery, and network independently (a 500-sample baseline plus a spiked live window, inserted directly into `metric_samples`) -- each correctly detected, diagnosed through the rule-based fallback (no `GROQ_API_KEY` in this environment), and the cpu domain correctly skipped the circular "CPU workload" branch entirely rather than reasoning about it. Battery's suggested-action `reason` string came out byte-for-byte identical to the pre-refactor wording (`"battery drain anomaly: 22.0W vs 8.3W baseline"`), confirming the generalization didn't regress the one path that was already validated.
+
+Not yet done: the fallback's rule-based reasoning is still shallow (one CPU-correlation check, nothing about candidate processes or GPU) -- exactly as it was for battery before this phase, just now shared. The `native UI` and AMD/Intel GPU telemetry remain the next layers after that.
 
 ### Phase 7: one detector, three domains — the start of "diagnose everything"
 
@@ -112,7 +143,7 @@ ANOMALY DETECTED (memory): memory-1789476582254
   Threshold 91.6%
 ```
 
-Not yet done, and the natural continuation: the Python diagnostic agent still only knows how to investigate battery incidents (`get_battery_anomaly_status()`); memory and CPU anomalies are detected but nothing diagnoses *why* yet. New collectors (network, disk I/O, per-process CPU attribution, thermal/fan) are the next layer after that.
+Not yet done (as of Phase 7): the Python diagnostic agent still only knows how to investigate battery incidents (`get_battery_anomaly_status()`); memory and CPU anomalies are detected but nothing diagnoses *why* yet. Phase 10 generalizes the diagnosis loop itself; new collectors (network, disk I/O, per-process CPU attribution, thermal/fan) came first, in Phase 8.
 
 ### Phase 6: closing the loop, from diagnosis to action
 
@@ -415,17 +446,17 @@ flowchart TD
     subgraph PYPROC["A SEPARATE PROCESS: python -m intelligence.main"]
         TOOLS["tools.py: SysIntelClient<br/>the only way the agent touches the machine"]
         SCHEMAS["schemas.py<br/>Pydantic models incl. Reading[T], ActionOutcome"]
-        AGENT["agent.py: BatteryDiagnosticAgent<br/>TRIAGE -&gt; HYPOTHESES -&gt; EVIDENCE -&gt; (LLM or fallback) -&gt; EXPLAIN<br/>+ _build_suggested_action() (plain code, not the LLM)"]
+        AGENT["agent.py: DiagnosticAgent(domain)<br/>one per battery/memory/cpu/network/disk<br/>TRIAGE -&gt; HYPOTHESES -&gt; EVIDENCE -&gt; (LLM or fallback) -&gt; EXPLAIN<br/>+ _build_suggested_action() (plain code, not the LLM; battery/cpu only)"]
         LLM["llm.py: select_hypothesis()<br/>the ONLY thing that touches an LLM"]
-        PYMAIN["main.py<br/>diagnose-battery: prints reasoned_by,<br/>asks 'Apply this now? [y/N]'"]
+        PYMAIN["main.py<br/>diagnose-&lt;domain&gt;: prints reasoned_by,<br/>asks 'Apply this now? [y/N]'"]
     end
 
     GROQ[["Groq API<br/>(external service)"]]
 
     PYMAIN --> AGENT
-    AGENT -->|"get_battery_anomaly_status()<br/>get_system_snapshot()<br/>get_metric_history()<br/>get_recent_events()"| TOOLS
+    AGENT -->|"get_<domain>_anomaly_status()<br/>get_system_snapshot()<br/>get_metric_history()<br/>get_recent_events()"| TOOLS
     TOOLS -.->|validates response into| SCHEMAS
-    TOOLS ==>|"subprocess: sysintel.exe status/history/check-battery/events --json<br/>(fixed subcommands + typed args, never a shell string)"| MAIN
+    TOOLS ==>|"subprocess: sysintel.exe status/history/check-&lt;domain&gt;/events --json<br/>(fixed subcommands + typed args, never a shell string)"| MAIN
 
     AGENT -->|"fixed hypothesis list + deterministically-gathered evidence only"| LLM
     LLM -->|"HTTPS, structured JSON response required"| GROQ
@@ -660,10 +691,10 @@ The dashboard, now with thirteen modes (`status`, `history`, `check-battery`/`ch
 The `--json` output uses the hand-written helpers in `core/util/json.hpp`, not a JSON library — the object shapes here are small and fixed, so a real library would be machinery this project doesn't need yet, the same call made about not vendoring a package manager just for SQLite. This JSON is the entire contract the Python agent depends on.
 
 ### [`intelligence/schemas.py`](intelligence/schemas.py)
-Pydantic models that mirror the CLI's JSON output exactly — `BatterySnapshot`, `SystemSnapshot`, `MetricHistory`, `Incident`, `BatteryCheckReport`, `SystemEvent`/`EventsResult`, `ActionOutcome`, and a generic `Reading[T]` mirroring `core/model/availability.hpp`'s `Reading<T>` field-for-field (`value` + `ok`/`unsupported`/`unavailable`/`error`). `GpuState` uses `Reading[T]` for every metric, so the availability distinction survives the C++ → JSON → Python round trip intact. Pydantic validates the shape on the way in, so if the C++ side's JSON ever drifts, it fails loudly right here instead of as a confusing bug three layers into the agent's reasoning.
+Pydantic models that mirror the CLI's JSON output exactly — `BatterySnapshot`, `SystemSnapshot`, `MetricHistory`, `Incident`, `BatteryCheckReport`, a generic `AnomalyCheckReport` (Phase 9, shared by memory/cpu/network/disk), `SystemEvent`/`EventsResult`, `ActionOutcome`, and a generic `Reading[T]` mirroring `core/model/availability.hpp`'s `Reading<T>` field-for-field (`value` + `ok`/`unsupported`/`unavailable`/`error`). `GpuState` uses `Reading[T]` for every metric, so the availability distinction survives the C++ → JSON → Python round trip intact. Pydantic validates the shape on the way in, so if the C++ side's JSON ever drifts, it fails loudly right here instead of as a confusing bug three layers into the agent's reasoning.
 
 ### [`intelligence/tools.py`](intelligence/tools.py)
-The agent's *only* way of touching the machine — this is literally the PRD's "Diagnostic Tool Interface." `SysIntelClient` exposes `get_system_snapshot` (now includes `gpu`), `get_metric_history`, `get_battery_anomaly_status`, `get_recent_events`, and — new this phase — `apply_change_power_mode()`/`rollback_action()`, each calling one fixed `sysintel.exe` subcommand via `subprocess.run` with a list of arguments, never a shell string. There is no method on this class that could execute an arbitrary command; the agent literally cannot construct one. `apply_change_power_mode()` defaults `approved=True` deliberately: by the time anything calls it, a human has already said yes (interactively in `main.py`, or via `--auto-approve`) — the real approval gate lives one layer up, not here.
+The agent's *only* way of touching the machine — this is literally the PRD's "Diagnostic Tool Interface." `SysIntelClient` exposes `get_system_snapshot` (now includes `gpu`), `get_metric_history`, `get_battery_anomaly_status`, `get_recent_events`, `apply_change_power_mode()`/`rollback_action()`, and — Phase 9 — one anomaly-status method per remaining domain (`get_memory_anomaly_status`, `get_cpu_anomaly_status`, `get_network_anomaly_status`, `get_disk_anomaly_status`, all sharing a private `_get_anomaly_status()` helper since they hit the same `check-<domain>` shape). Each public method calls one fixed `sysintel.exe` subcommand via `subprocess.run` with a list of arguments, never a shell string. There is no method on this class that could execute an arbitrary command; the agent literally cannot construct one. `apply_change_power_mode()` defaults `approved=True` deliberately: by the time anything calls it, a human has already said yes (interactively in `main.py`, or via `--auto-approve`) — the real approval gate lives one layer up, not here.
 
 ### [`intelligence/llm.py`](intelligence/llm.py)
 The entire LLM boundary, and nothing more than that. `select_hypothesis()` takes the fixed hypothesis list and whatever evidence `agent.py` already gathered deterministically, and asks Groq to (a) pick a winner from the *given* IDs — never invent a new one — and (b) write the confidence/finding/recommendation. The model has no tools and never touches the machine; every fact it reasons over was collected by plain function calls before it was ever consulted. Output is constrained to JSON validated against `LlmDiagnosisResult`, so a malformed or off-script response raises `LlmUnavailableError` instead of silently corrupting what gets printed. Reads `GROQ_API_KEY`/`GROQ_MODEL` from `intelligence/.env` (via `python-dotenv`), which is gitignored — the repo only ships `.env.example` as a template.
@@ -671,19 +702,19 @@ The entire LLM boundary, and nothing more than that. `select_hypothesis()` takes
 **Note on the project's own confidence-scoring principle:** the tech design explicitly says not to let an LLM invent confidence numbers, preferring a fixed evidence-based rubric. This module deliberately does let the model set confidence, because that's specifically what was asked for in this round — verified in testing that it behaves reasonably (75% when CPU evidence strongly supports the winning hypothesis, 30% when it doesn't), but this is a conscious deviation from that earlier principle, not an oversight.
 
 ### [`intelligence/agent.py`](intelligence/agent.py)
-The reasoning loop: TRIAGE → GENERATE HYPOTHESES → COLLECT EVIDENCE → EVALUATE/DIAGNOSIS (now delegated to `llm.py`) → EXPLAIN. `BatteryDiagnosticAgent.diagnose()`:
-1. Checks whether there's actually an open battery incident (TRIAGE) — bails out honestly if not, or if there isn't enough history yet.
-2. Holds three fixed hypotheses: CPU workload (H1), GPU activity (H2), or unexplained (H3).
-3. Deterministically gathers CPU history (24h baseline vs last 5 minutes), current GPU state (including its availability), the process list, and — new this round — recent events filtered to a window around the incident's start time, giving a list of processes that started right before the anomaly began.
-4. Hands hypotheses + evidence to `llm.select_hypothesis()`.
-5. If that raises `LlmUnavailableError` (no key, network failure, bad response), `_fallback_diagnose()` takes over: the same CPU-threshold logic the rule-based version always used, explicitly labeled as a fallback in its own evidence line rather than silently pretending to be the LLM path.
+The reasoning loop: TRIAGE → GENERATE HYPOTHESES → COLLECT EVIDENCE → EVALUATE/DIAGNOSIS (delegated to `llm.py`) → EXPLAIN. Generalized in Phase 10 into `DiagnosticAgent(tools, domain, min_history_days)`, one instance per domain (`"battery"`, `"memory"`, `"cpu"`, `"network"`, `"disk"`); `BatteryDiagnosticAgent` is now a thin subclass fixing `domain="battery"`. `diagnose()`:
+1. Checks whether there's actually an open incident in this domain (TRIAGE) via that domain's `_config.check_method` — bails out honestly if not, or if there isn't enough history yet. `_normalize_check()` flattens `BatteryCheckReport`'s renamed `*_watts` fields and the generic `AnomalyCheckReport`'s fields into one shared shape first, so everything below this line is domain-agnostic.
+2. Holds each domain's own fixed hypothesis set (`_DomainConfig.hypotheses`): battery keeps its original three (CPU workload, GPU activity, unexplained); cpu swaps out "CPU workload" for "GPU-correlated load" since offering CPU workload as the explanation for a *CPU* anomaly would be circular; memory/network/disk share a third set (CPU-correlated, a recently-started process, unexplained).
+3. Deterministically gathers GPU state, the process list, and events filtered to a window around the incident's start time (candidate processes that started right before the anomaly) — for every domain except cpu, also a CPU history correlate (24h baseline vs last 5 minutes); skipped for cpu itself since that would just restate the domain's own evidence under a colliding key.
+4. Hands that domain's hypotheses + evidence to `llm.select_hypothesis()`.
+5. If that raises `LlmUnavailableError` (no key, network failure, bad response), `_fallback_diagnose()` takes over: the same CPU-threshold rule every domain always used, resolved via `_DomainConfig.cpu_workload_hypothesis_id` (`None` for cpu, so that domain's fallback always lands on "insufficient evidence" instead of reasoning in a circle) — explicitly labeled as a fallback in its own evidence line rather than silently pretending to be the LLM path.
 
 Every `Diagnosis` carries a `reasoned_by` field (`"llm"` or `"rule-based"`), and `main.py` always prints which one actually ran — never letting a degraded response masquerade as a full one.
 
-**Phase 6 addition:** `_build_suggested_action(check)` is a plain function, not an LLM call — given an open/ongoing anomaly, it always proposes the same `change_power_mode`/`best_power_efficiency` action, wrapped in a `SuggestedAction` (`action_type`, `params`, `reason`, `description`) and attached to every `Diagnosis` regardless of which path produced it (LLM or fallback) or which hypothesis won. The LLM's `recommended_action` text and this `suggested_action` value are two separate things: one is prose the model wrote, the other is a fixed, code-computed action_type/params pair the Action Broker already recognizes. Only the second one can ever actually execute.
+**Suggested actions (Phase 6, scoped in Phase 10):** `_build_suggested_action()` is a plain function, not an LLM call — given an open/ongoing anomaly, it proposes the same `change_power_mode`/`best_power_efficiency` action, wrapped in a `SuggestedAction` (`action_type`, `params`, `reason`, `description`). It's only offered for domains where `_DomainConfig.action_reason_label` is set (battery and cpu — the Action Broker's one capability is a genuine lever on CPU/GPU power draw); memory/network/disk diagnose but never suggest an action, since a power-mode change doesn't actually fix a memory leak or elevated network/disk throughput. The LLM's `recommended_action` text and this `suggested_action` value are two separate things: one is prose the model wrote, the other is a fixed, code-computed action_type/params pair the Action Broker already recognizes. Only the second one can ever actually execute.
 
 ### [`intelligence/main.py`](intelligence/main.py)
-The Python entry point — `python -m intelligence.main diagnose-battery [--db path] [--sysintel-exe path] [--min-history-days n] [--auto-approve] [--no-act]`. Wires a `SysIntelClient` to a `BatteryDiagnosticAgent`, prints which reasoning path ran, then the diagnosis. Also reconfigures stdout to UTF-8 on the way in — Windows' console defaults to a legacy codepage that can't encode a lot of ordinary Unicode punctuation an LLM will happily produce (hit this for real: a narrow no-break space in one response crashed the print before this fix).
+The Python entry point — `python -m intelligence.main diagnose-<domain> [--db path] [--sysintel-exe path] [--min-history-days n] [--auto-approve] [--no-act]` for `<domain>` in `battery`/`memory`/`cpu`/`network`/`disk` (Phase 10; one `argparse` subparser per domain, added identically by `_add_diagnose_subparser()`). Wires a `SysIntelClient` to a `DiagnosticAgent` for that domain, prints which reasoning path ran, then the diagnosis. Also reconfigures stdout to UTF-8 on the way in — Windows' console defaults to a legacy codepage that can't encode a lot of ordinary Unicode punctuation an LLM will happily produce (hit this for real: a narrow no-break space in one response crashed the print before this fix).
 
 `handle_suggested_action()` is the actual approval gate for Phase 6's closed loop: if `diagnosis.suggested_action` is set and `--no-act` wasn't passed, it prints the action's description and asks `Apply this now? [y/N]` — unless `--auto-approve` skips the prompt. Only on a yes does it call `tools.apply_change_power_mode()`, then prints the resulting `ActionOutcome` the same way the CLI's own `sysintel act` would. Declining prints the exact equivalent `sysintel act` command instead, so nothing is lost by saying no.
 
@@ -746,10 +777,10 @@ No key configured, or the API call fails for any reason? The agent automatically
 
 ## What's next
 
-The stated direction is comprehensive coverage: "all the information, diagnose everything," not just battery. Phase 7 generalized *detection* to three domains; Phase 8 filled the missing collectors. What's still not touched:
+The stated direction is comprehensive coverage: "all the information, diagnose everything," not just battery. Phase 7 generalized *detection* to three domains; Phase 8 filled the missing collectors; Phase 9 wired network/disk into detection; Phase 10 generalized *diagnosis* to all five checkable domains. What's still not touched:
 
-- **None of the four new collectors (network, disk I/O, per-process CPU, thermal/fan) feed history or anomaly detection yet.** They're live-state only, the same place GPU state was left in Phase 3.5 — `sysintel network`/`disk`/`top-cpu`/`thermal` show you what's happening right now, but nothing is recorded to SQLite or checked against a baseline. Wiring network/disk throughput into the sampler (aggregate across adapters/disks, matching how GPU could eventually get the same treatment) is the natural extension once there's a reason to alarm on them.
-- **The Python agent still only diagnoses battery incidents.** `check-memory`/`check-cpu` will happily open incidents, but nothing investigates *why* yet, and now there's real per-domain evidence (network throughput, disk I/O, per-process CPU, thermal state) that a generalized agent could actually reason over. `BatteryDiagnosticAgent` needs to become domain-aware (or per-domain agents need to exist alongside it), with per-domain hypothesis sets. This is the natural next slice, and arguably the most valuable one now that there's real data behind every domain.
-- **A second safe action**, something CPU-drain-specific (e.g. disabling a startup application) rather than only battery-mode — once it exists, `_build_suggested_action()` needs real logic for *which* action fits *which* winning hypothesis/domain, instead of always proposing the same one regardless.
+- **Per-process CPU and thermal/fan still don't feed history or anomaly detection.** They remain live-state only, the same place GPU state was left in Phase 3.5 — `sysintel top-cpu`/`thermal` show what's happening right now, but nothing is recorded to SQLite or checked against a baseline. Per-process CPU doesn't reduce to one time series the way network/disk did (it's a ranked list of many short-lived instances), so this isn't a mechanical repeat of Phase 9 — it needs its own design (e.g. alarming per-process, or on the top process's share) rather than a total.
+- **The rule-based fallback is still shallow everywhere, not just for battery.** `_fallback_diagnose()` only ever checks one CPU-correlation threshold; it doesn't reason about candidate processes (gathered as evidence, but only the LLM path actually uses them) or GPU state. Real per-domain diagnosis quality still depends on the LLM being reachable.
+- **A second safe action**, something CPU-drain-specific (e.g. disabling a startup application) rather than only power-mode — once it exists, `_build_suggested_action()` needs real logic for *which* action fits *which* winning hypothesis/domain, instead of every offering domain proposing the same one regardless.
 
 Still separately outstanding: the NVML path needs verification on real NVIDIA hardware (everything checkable without it has been); `best_performance`'s GUID mapping wants the same live cross-check `best_power_efficiency` already got; hypothesis-selection confidence is LLM-set (a conscious, documented departure from the tech design's §32 "don't let the LLM invent confidence" principle, which still holds for every deterministic part of this system); and AMD/Intel GPU providers, true ETW-based event tracking, retention/rollup, and the eventual named-pipe IPC all remain deliberately deferred until their absence actually starts costing something.

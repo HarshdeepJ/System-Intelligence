@@ -1,4 +1,5 @@
-"""The battery-drain diagnostic agent.
+"""The resource-anomaly diagnostic agent, generalized across every domain
+the CLI can check (battery, memory, cpu, network, disk).
 
 State machine: TRIAGE -> GENERATE HYPOTHESES -> COLLECT EVIDENCE -> EVALUATE
 -> DIAGNOSIS -> EXPLAIN (see tech design's "Agent Architecture").
@@ -11,12 +12,22 @@ confident to be, how to phrase the finding) goes to an LLM via llm.py. If
 the LLM is unreachable (no API key, network failure, malformed response),
 a deterministic rule-based fallback takes over so this still produces a
 usable diagnosis -- degraded, not broken.
+
+This started as battery-only (Phase 6); the state machine and evidence
+gathering had nothing battery-specific about them except which check-*
+tool to call and how to phrase the headline evidence line, so DiagnosticAgent
+below pulls that out into a per-domain _DomainConfig, the same "prove the
+abstraction against a second real case" move Phase 7 made for
+AnomalyDetector. BatteryDiagnosticAgent stays as a thin, name-preserving
+subclass so existing imports don't need to know about the generalization.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Optional
 
 from . import llm
+from .schemas import BatteryCheckReport, Incident
 from .tools import SysIntelClient
 
 
@@ -48,25 +59,43 @@ class Diagnosis:
     suggested_action: SuggestedAction | None = None
 
 
-def _build_suggested_action(check) -> SuggestedAction:
-    """The one action this project can currently take. Offered whenever
-    there's an open/ongoing battery anomaly, regardless of which hypothesis
-    the diagnosis settles on: Best Power Efficiency mode reduces both CPU-
-    and GPU-adjacent power draw at the OS level, so it's a reasonable,
-    fully-reversible thing to try even when the root cause isn't pinned
-    down exactly."""
-    return SuggestedAction(
-        action_type="change_power_mode",
-        params={"level": "best_power_efficiency"},
-        reason=(
-            f"battery drain anomaly: {check.live_mean_watts:.1f}W vs "
-            f"{check.baseline_mean_watts:.1f}W baseline"
-        ),
-        description="Switch Windows' battery Power Mode to 'Best power efficiency'",
+@dataclass
+class _NormalizedCheck:
+    """BatteryCheckReport and the generic AnomalyCheckReport carry the same
+    information under different field names (live_mean_watts vs live_mean,
+    etc.) -- a real shape difference, documented in schemas.py, not just
+    inconsistent naming. This is the one place that difference gets
+    flattened so the rest of the agent can be domain-agnostic."""
+
+    result: str
+    live_mean: float
+    baseline_mean: float
+    baseline_stddev: float
+    threshold: float
+    incident: Optional[Incident]
+
+
+def _normalize_check(check) -> _NormalizedCheck:
+    if isinstance(check, BatteryCheckReport):
+        return _NormalizedCheck(
+            result=check.result,
+            live_mean=check.live_mean_watts,
+            baseline_mean=check.baseline_mean_watts,
+            baseline_stddev=check.baseline_stddev_watts,
+            threshold=check.threshold_watts,
+            incident=check.incident,
+        )
+    return _NormalizedCheck(
+        result=check.result,
+        live_mean=check.live_mean,
+        baseline_mean=check.baseline_mean,
+        baseline_stddev=check.baseline_stddev,
+        threshold=check.threshold,
+        incident=check.incident,
     )
 
 
-_HYPOTHESES = [
+_BATTERY_HYPOTHESES = [
     {"id": "H1", "description": "System-wide CPU workload is responsible"},
     {
         "id": "H2",
@@ -80,21 +109,135 @@ _HYPOTHESES = [
     },
 ]
 
+# CPU's own hypothesis set can't reuse "system-wide CPU workload is
+# responsible" as a candidate explanation for a CPU anomaly -- that's
+# circular, not a hypothesis. GPU-correlated load and an unexplained
+# fallback both still make sense, so those carry over.
+_CPU_HYPOTHESES = [
+    {
+        "id": "H1",
+        "description": "GPU activity is correlated with the CPU load (e.g. a game or "
+        "GPU-accelerated workload driving both)",
+    },
+    {"id": "H2", "description": "A process that started right before the anomaly is responsible"},
+    {"id": "H3", "description": "Unexplained by evidence this agent currently checks"},
+]
 
-class BatteryDiagnosticAgent:
-    def __init__(self, tools: SysIntelClient, min_history_days: int = 14):
+# Shared by memory, network, and disk: none of these have a domain-specific
+# secondary signal the way battery has GPU, so the candidate explanations
+# are the two general-purpose correlates this agent can actually check
+# (system-wide CPU load, a recently-started process) plus honest
+# uncertainty.
+_RESOURCE_HYPOTHESES = [
+    {"id": "H1", "description": "System-wide CPU workload is correlated with the anomaly"},
+    {"id": "H2", "description": "A process that started right before the anomaly is responsible"},
+    {"id": "H3", "description": "Unexplained by evidence this agent currently checks"},
+]
+
+
+@dataclass(frozen=True)
+class _DomainConfig:
+    check_method: str  # SysIntelClient method name for this domain's anomaly check
+    label: str  # human-readable headline, e.g. "battery discharge"
+    unit: str  # matches the unit string main.cpp prints for this metric (" B/s" has its
+    # own leading space, "%"/"W" don't)
+    hypotheses: list[dict]
+    # Which hypothesis ID means "system-wide CPU workload correlates" -- None where that
+    # would be circular (the cpu domain itself) or where a domain doesn't offer it.
+    cpu_workload_hypothesis_id: Optional[str]
+    # Text used in a suggested action's `reason` (e.g. "battery drain anomaly: ..."). None
+    # means this domain doesn't offer a suggested action at all: the Action Broker's only
+    # capability, change_power_mode, is a genuine lever on CPU/GPU power draw (hence
+    # battery and cpu), but not a real fix for a memory leak or elevated network/disk I/O --
+    # offering it there would overstate what this agent can actually do.
+    action_reason_label: Optional[str]
+
+
+_DOMAINS: dict[str, _DomainConfig] = {
+    "battery": _DomainConfig(
+        check_method="get_battery_anomaly_status",
+        label="battery discharge",
+        unit="W",
+        hypotheses=_BATTERY_HYPOTHESES,
+        cpu_workload_hypothesis_id="H1",
+        action_reason_label="battery drain",
+    ),
+    "cpu": _DomainConfig(
+        check_method="get_cpu_anomaly_status",
+        label="CPU utilization",
+        unit="%",
+        hypotheses=_CPU_HYPOTHESES,
+        cpu_workload_hypothesis_id=None,
+        action_reason_label="CPU load",
+    ),
+    "memory": _DomainConfig(
+        check_method="get_memory_anomaly_status",
+        label="memory load",
+        unit="%",
+        hypotheses=_RESOURCE_HYPOTHESES,
+        cpu_workload_hypothesis_id="H1",
+        action_reason_label=None,
+    ),
+    "network": _DomainConfig(
+        check_method="get_network_anomaly_status",
+        label="network throughput",
+        unit=" B/s",
+        hypotheses=_RESOURCE_HYPOTHESES,
+        cpu_workload_hypothesis_id="H1",
+        action_reason_label=None,
+    ),
+    "disk": _DomainConfig(
+        check_method="get_disk_anomaly_status",
+        label="disk I/O throughput",
+        unit=" B/s",
+        hypotheses=_RESOURCE_HYPOTHESES,
+        cpu_workload_hypothesis_id="H1",
+        action_reason_label=None,
+    ),
+}
+
+
+def _build_suggested_action(reason_label: str, live_mean: float, baseline_mean: float, unit: str) -> SuggestedAction:
+    """The one action this project can currently take, offered whenever
+    there's an open/ongoing anomaly in a domain the Action Broker's lever
+    actually addresses: Best Power Efficiency mode reduces both CPU- and
+    GPU-adjacent power draw at the OS level, so it's a reasonable, fully-
+    reversible thing to try even when the root cause isn't pinned down
+    exactly."""
+    return SuggestedAction(
+        action_type="change_power_mode",
+        params={"level": "best_power_efficiency"},
+        reason=f"{reason_label} anomaly: {live_mean:.1f}{unit} vs {baseline_mean:.1f}{unit} baseline",
+        description="Switch Windows' battery Power Mode to 'Best power efficiency'",
+    )
+
+
+class DiagnosticAgent:
+    def __init__(self, tools: SysIntelClient, domain: str, min_history_days: int = 14):
+        if domain not in _DOMAINS:
+            raise ValueError(f"unknown diagnosis domain: {domain!r} (expected one of {sorted(_DOMAINS)})")
         self.tools = tools
+        self.domain = domain
         self.min_history_days = min_history_days
+        self._config = _DOMAINS[domain]
+
+    def _maybe_action(self, norm: _NormalizedCheck) -> SuggestedAction | None:
+        if self._config.action_reason_label is None:
+            return None
+        return _build_suggested_action(
+            self._config.action_reason_label, norm.live_mean, norm.baseline_mean, self._config.unit
+        )
 
     def diagnose(self) -> Diagnosis:
         # TRIAGE: is there actually something to investigate?
-        check = self.tools.get_battery_anomaly_status(self.min_history_days)
+        check = getattr(self.tools, self._config.check_method)(self.min_history_days)
+        norm = _normalize_check(check)
 
-        if check.result == "not_enough_history":
+        if norm.result == "not_enough_history":
             return Diagnosis(
-                finding="Not enough accumulated history to evaluate battery anomalies yet.",
+                finding=f"Not enough accumulated history to evaluate {self.domain} anomalies yet.",
                 confidence=1.0,
-                evidence=[f"check-battery reports '{check.result}'"],
+                evidence=[f"check-{self.domain} reports '{norm.result}'"],
                 alternative_explanations=[],
                 recommended_action="none -- keep recording",
                 risk="n/a",
@@ -102,11 +245,11 @@ class BatteryDiagnosticAgent:
                 reasoned_by="rule-based",
             )
 
-        if check.result not in ("anomaly_opened", "anomaly_ongoing"):
+        if norm.result not in ("anomaly_opened", "anomaly_ongoing"):
             return Diagnosis(
-                finding="No active battery anomaly to diagnose.",
+                finding=f"No active {self.domain} anomaly to diagnose.",
                 confidence=1.0,
-                evidence=[f"check-battery reports '{check.result}'"],
+                evidence=[f"check-{self.domain} reports '{norm.result}'"],
                 alternative_explanations=[],
                 recommended_action="none",
                 risk="none",
@@ -116,33 +259,24 @@ class BatteryDiagnosticAgent:
 
         # COLLECT EVIDENCE (entirely deterministic)
         snapshot = self.tools.get_system_snapshot()
-        cpu_baseline = self.tools.get_metric_history("cpu.utilization", last_minutes=60 * 24)
-        cpu_recent = self.tools.get_metric_history("cpu.utilization", last_minutes=5)
 
         candidate_processes = []
-        if check.incident is not None:
+        if norm.incident is not None:
             events = self.tools.get_recent_events(last_minutes=60 * 24, limit=200)
-            window_start = check.incident.started_at_ms - 15 * 60 * 1000
-            window_end = check.incident.started_at_ms + 5 * 60 * 1000
+            window_start = norm.incident.started_at_ms - 15 * 60 * 1000
+            window_end = norm.incident.started_at_ms + 5 * 60 * 1000
             candidate_processes = [
                 e.data.get("name", "?")
                 for e in events.events
                 if e.type == "process.started" and window_start <= e.timestamp_ms <= window_end
             ]
 
-        evidence = {
-            "battery": {
-                "live_watts": round(check.live_mean_watts, 2),
-                "baseline_watts": round(check.baseline_mean_watts, 2),
-                "threshold_watts": round(check.threshold_watts, 2),
-            },
-            "cpu": {
-                "recent_5min_avg_percent": (
-                    round(cpu_recent.avg, 1) if cpu_recent.avg is not None else None
-                ),
-                "baseline_24h_avg_percent": (
-                    round(cpu_baseline.avg, 1) if cpu_baseline.avg is not None else None
-                ),
+        evidence: dict = {
+            self.domain: {
+                "live": round(norm.live_mean, 2),
+                "baseline": round(norm.baseline_mean, 2),
+                "threshold": round(norm.threshold, 2),
+                "unit": self._config.unit.strip(),
             },
             "gpu": [
                 {
@@ -160,22 +294,41 @@ class BatteryDiagnosticAgent:
             "processes_started_near_incident_onset": candidate_processes or None,
         }
 
+        # cpu.utilization history is only a useful *correlate* for a non-CPU
+        # anomaly -- for the cpu domain it would just restate evidence[self.domain]
+        # under a colliding "cpu" key.
+        if self.domain != "cpu":
+            cpu_baseline = self.tools.get_metric_history("cpu.utilization", last_minutes=60 * 24)
+            cpu_recent = self.tools.get_metric_history("cpu.utilization", last_minutes=5)
+            evidence["cpu"] = {
+                "recent_5min_avg_percent": (
+                    round(cpu_recent.avg, 1) if cpu_recent.avg is not None else None
+                ),
+                "baseline_24h_avg_percent": (
+                    round(cpu_baseline.avg, 1) if cpu_baseline.avg is not None else None
+                ),
+            }
+
+        headline = (
+            f"{self._config.label}: {evidence[self.domain]['live']}{self._config.unit} observed vs "
+            f"{evidence[self.domain]['baseline']}{self._config.unit} baseline "
+            f"(threshold {evidence[self.domain]['threshold']}{self._config.unit})"
+        )
+
         # EVALUATE + DIAGNOSIS: LLM picks the best-supported hypothesis and
         # writes the explanation, with a deterministic fallback if it can't.
         try:
-            result = llm.select_hypothesis(_HYPOTHESES, evidence)
+            result = llm.select_hypothesis(self._config.hypotheses, evidence)
             winning = next(
-                (h["description"] for h in _HYPOTHESES if h["id"] == result.winning_hypothesis_id),
+                (h["description"] for h in self._config.hypotheses if h["id"] == result.winning_hypothesis_id),
                 result.winning_hypothesis_id,
             )
             alternatives = [
-                h["description"] for h in _HYPOTHESES if h["id"] != result.winning_hypothesis_id
+                h["description"]
+                for h in self._config.hypotheses
+                if h["id"] != result.winning_hypothesis_id
             ]
-            evidence_lines = [
-                f"Battery discharge: {evidence['battery']['live_watts']}W observed vs "
-                f"{evidence['battery']['baseline_watts']}W baseline "
-                f"(threshold {evidence['battery']['threshold_watts']}W)"
-            ]
+            evidence_lines = [headline]
             evidence_lines.extend(result.reasoning_notes)
             return Diagnosis(
                 finding=f"{winning} -- {result.finding}",
@@ -186,68 +339,85 @@ class BatteryDiagnosticAgent:
                 risk=result.risk,
                 expected_result=result.expected_result,
                 reasoned_by="llm",
-                suggested_action=_build_suggested_action(check),
+                suggested_action=self._maybe_action(norm),
             )
         except llm.LlmUnavailableError as exc:
-            return self._fallback_diagnose(check, evidence, reason=str(exc))
+            return self._fallback_diagnose(norm, evidence, headline, reason=str(exc))
 
-    def _fallback_diagnose(self, check, evidence: dict, reason: str) -> Diagnosis:
+    def _fallback_diagnose(
+        self, norm: _NormalizedCheck, evidence: dict, headline: str, reason: str
+    ) -> Diagnosis:
         """Deterministic rule-based reasoning, used only when the LLM step
-        couldn't run at all. Mirrors the pre-LLM logic: CPU-elevated wins H1,
-        otherwise it's honestly unexplained (H3) -- this fallback doesn't
-        attempt GPU reasoning, since evaluating GPU evidence nuance is
-        exactly the kind of judgment call this project chose to hand to the
-        LLM rather than keep growing a rule set for.
+        couldn't run at all. Mirrors the pre-LLM battery logic: CPU-elevated
+        wins the "system-wide CPU workload" hypothesis where the domain
+        offers one, otherwise it's honestly unexplained -- this fallback
+        doesn't attempt GPU or candidate-process reasoning, since evaluating
+        that nuance is exactly the kind of judgment call this project chose
+        to hand to the LLM rather than keep growing a rule set for.
         """
-        cpu_recent_avg = evidence["cpu"]["recent_5min_avg_percent"]
-        cpu_baseline_avg = evidence["cpu"]["baseline_24h_avg_percent"]
+        evidence_lines = [headline, f"[LLM reasoning unavailable, used rule-based fallback: {reason}]"]
 
-        evidence_lines = [
-            f"Battery discharge: {evidence['battery']['live_watts']}W observed vs "
-            f"{evidence['battery']['baseline_watts']}W baseline "
-            f"(threshold {evidence['battery']['threshold_watts']}W)",
-            f"[LLM reasoning unavailable, used rule-based fallback: {reason}]",
-        ]
+        cpu_evidence = evidence.get("cpu")
+        cpu_hypothesis_id = self._config.cpu_workload_hypothesis_id
+        if cpu_evidence is not None and cpu_hypothesis_id is not None:
+            cpu_recent_avg = cpu_evidence["recent_5min_avg_percent"]
+            cpu_baseline_avg = cpu_evidence["baseline_24h_avg_percent"]
 
-        if cpu_recent_avg is not None and cpu_baseline_avg is not None:
-            evidence_lines.append(
-                f"CPU utilization: {cpu_recent_avg}% now vs {cpu_baseline_avg}% (24h average)"
-            )
-            cpu_elevated = cpu_recent_avg > cpu_baseline_avg * 1.5 and cpu_recent_avg > 30
-            if cpu_elevated:
-                return Diagnosis(
-                    finding="System-wide CPU workload is responsible",
-                    confidence=0.7,
-                    evidence=evidence_lines,
-                    alternative_explanations=[h["description"] for h in _HYPOTHESES[1:]],
-                    recommended_action=(
-                        "Investigate which process is driving CPU usage; consider closing it "
-                        "or switching to a lower power plan."
-                    ),
-                    risk="low -- this is a diagnosis only, no action was taken",
-                    expected_result=(
-                        f"Battery discharge should return toward the "
-                        f"{evidence['battery']['baseline_watts']}W baseline."
-                    ),
-                    reasoned_by="rule-based",
-                    suggested_action=_build_suggested_action(check),
+            if cpu_recent_avg is not None and cpu_baseline_avg is not None:
+                evidence_lines.append(
+                    f"CPU utilization: {cpu_recent_avg}% now vs {cpu_baseline_avg}% (24h average)"
                 )
-            evidence_lines.append(
-                f"CPU utilization ({cpu_recent_avg}%) is close to its normal range -- "
-                "unlikely to explain the excess draw"
-            )
-        else:
-            evidence_lines.append("Not enough CPU history to evaluate CPU as a cause.")
+                cpu_elevated = cpu_recent_avg > cpu_baseline_avg * 1.5 and cpu_recent_avg > 30
+                if cpu_elevated:
+                    winning = next(
+                        h["description"] for h in self._config.hypotheses if h["id"] == cpu_hypothesis_id
+                    )
+                    alternatives = [
+                        h["description"]
+                        for h in self._config.hypotheses
+                        if h["id"] != cpu_hypothesis_id
+                    ]
+                    return Diagnosis(
+                        finding=winning,
+                        confidence=0.7,
+                        evidence=evidence_lines,
+                        alternative_explanations=alternatives,
+                        recommended_action=(
+                            "Investigate which process is driving CPU usage; consider closing it "
+                            "or switching to a lower power plan."
+                        ),
+                        risk="low -- this is a diagnosis only, no action was taken",
+                        expected_result=(
+                            f"{self.domain.capitalize()} should return toward its "
+                            f"{evidence[self.domain]['baseline']}{self._config.unit} baseline."
+                        ),
+                        reasoned_by="rule-based",
+                        suggested_action=self._maybe_action(norm),
+                    )
+                evidence_lines.append(
+                    f"CPU utilization ({cpu_recent_avg}%) is close to its normal range -- "
+                    "unlikely to explain the anomaly"
+                )
+            else:
+                evidence_lines.append("Not enough CPU history to evaluate CPU as a cause.")
 
         return Diagnosis(
-            finding="Battery drain is confirmed abnormal, but current evidence is insufficient "
-            "to identify a specific cause.",
+            finding=f"{self.domain.capitalize()} anomaly is confirmed abnormal, but current evidence "
+            "is insufficient to identify a specific cause.",
             confidence=0.1,
             evidence=evidence_lines,
-            alternative_explanations=[h["description"] for h in _HYPOTHESES],
+            alternative_explanations=[h["description"] for h in self._config.hypotheses],
             recommended_action="none -- reporting uncertainty rather than guessing",
             risk="n/a",
             expected_result="n/a",
             reasoned_by="rule-based",
-            suggested_action=_build_suggested_action(check),
+            suggested_action=self._maybe_action(norm),
         )
+
+
+class BatteryDiagnosticAgent(DiagnosticAgent):
+    """Thin, name-preserving wrapper kept for existing callers/imports --
+    equivalent to DiagnosticAgent(tools, "battery", min_history_days)."""
+
+    def __init__(self, tools: SysIntelClient, min_history_days: int = 14):
+        super().__init__(tools, "battery", min_history_days)

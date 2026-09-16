@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .agent import BatteryDiagnosticAgent, Diagnosis
+from .agent import Diagnosis, DiagnosticAgent
 from .schemas import ActionOutcome
 from .tools import SysIntelClient, SysIntelToolError
 
@@ -101,11 +101,20 @@ def default_sysintel_exe() -> str:
     return str(Path(__file__).resolve().parent.parent / "build" / "sysintel.exe")
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="intelligence")
-    sub = parser.add_subparsers(dest="command", required=True)
+# Every domain DiagnosticAgent knows about (see agent.py's _DOMAINS) gets the
+# same diagnose-<domain> subcommand, wired up identically -- only the domain
+# name and help text differ.
+_DIAGNOSE_COMMANDS: dict[str, tuple[str, str]] = {
+    "diagnose-battery": ("battery", "Investigate a battery-drain anomaly"),
+    "diagnose-memory": ("memory", "Investigate a memory-usage anomaly"),
+    "diagnose-cpu": ("cpu", "Investigate a CPU-usage anomaly"),
+    "diagnose-network": ("network", "Investigate a network-throughput anomaly"),
+    "diagnose-disk": ("disk", "Investigate a disk I/O anomaly"),
+}
 
-    diag = sub.add_parser("diagnose-battery", help="Investigate a battery-drain anomaly")
+
+def _add_diagnose_subparser(sub: argparse._SubParsersAction, command: str, help_text: str) -> None:
+    diag = sub.add_parser(command, help=help_text)
     diag.add_argument("--db", default="sysintel.db")
     diag.add_argument("--sysintel-exe", default=default_sysintel_exe())
     diag.add_argument("--min-history-days", type=int, default=14)
@@ -120,11 +129,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Never offer to apply an action -- diagnosis only",
     )
 
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="intelligence")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    for command, (_, help_text) in _DIAGNOSE_COMMANDS.items():
+        _add_diagnose_subparser(sub, command, help_text)
+
     args = parser.parse_args(argv)
 
-    if args.command == "diagnose-battery":
+    if args.command in _DIAGNOSE_COMMANDS:
+        domain, _ = _DIAGNOSE_COMMANDS[args.command]
         tools = SysIntelClient(args.sysintel_exe, args.db)
-        agent = BatteryDiagnosticAgent(tools, min_history_days=args.min_history_days)
+        agent = DiagnosticAgent(tools, domain, min_history_days=args.min_history_days)
         try:
             diagnosis = agent.diagnose()
         except SysIntelToolError as exc:
