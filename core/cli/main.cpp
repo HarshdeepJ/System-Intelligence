@@ -824,7 +824,7 @@ int run_check_generic(const std::string& db_path, const std::string& metric,
 }
 
 int run_watch(const std::string& db_path, int min_history_days) {
-    std::cout << "Watching battery/CPU/memory/network/disk/top-cpu/thermal (recording + anomaly "
+    std::cout << "Watching battery/CPU/memory/network/disk/top-cpu/thermal/fan (recording + anomaly "
                  "checks) -- Ctrl+C to stop\n";
     std::cout << "Anomaly baseline requires " << min_history_days
                << " day(s) of accumulated history.\n\n";
@@ -874,6 +874,12 @@ int run_watch(const std::string& db_path, int min_history_days) {
     thermal_config.min_history_days = min_history_days;
     AnomalyDetector thermal_detector(store, thermal_config);
 
+    AnomalyDetectorConfig fan_config;
+    fan_config.metric = "thermal.fan_rpm";
+    fan_config.domain = "fan";
+    fan_config.min_history_days = min_history_days;
+    AnomalyDetector fan_detector(store, fan_config);
+
     sampler.set_periodic_hook(std::chrono::seconds(60), [&]() {
         std::cout << "[watch] ";
         print_check_report(battery_detector.check());
@@ -889,6 +895,8 @@ int run_watch(const std::string& db_path, int min_history_days) {
         print_generic_check_report("top-cpu", "%", top_cpu_detector.check());
         std::cout << "[watch] ";
         print_generic_check_report("thermal", "C", thermal_detector.check());
+        std::cout << "[watch] ";
+        print_generic_check_report("fan", " rpm", fan_detector.check());
     });
 
     sampler.run();
@@ -916,7 +924,8 @@ void print_usage() {
                << "  sysintel check-network [--db <path>] [--min-history-days <n>] [--json]\n"
                << "  sysintel check-disk [--db <path>] [--min-history-days <n>] [--json]\n"
                << "  sysintel check-top-cpu [--db <path>] [--min-history-days <n>] [--json]\n"
-               << "  sysintel check-thermal [--db <path>] [--min-history-days <n>] [--json]\n";
+               << "  sysintel check-thermal [--db <path>] [--min-history-days <n>] [--json]\n"
+               << "  sysintel check-fan [--db <path>] [--min-history-days <n>] [--json]\n";
 }
 
 }  // namespace
@@ -1142,7 +1151,8 @@ int main(int argc, char** argv) {
     }
 
     if (command == "check-memory" || command == "check-cpu" || command == "check-network" ||
-        command == "check-disk" || command == "check-top-cpu" || command == "check-thermal") {
+        command == "check-disk" || command == "check-top-cpu" || command == "check-thermal" ||
+        command == "check-fan") {
         std::string db_path = "sysintel.db";
         int min_history_days = 14;
         bool as_json = false;
@@ -1176,8 +1186,12 @@ int main(int argc, char** argv) {
             return run_check_generic(db_path, "process.top_cpu_percent", "top_cpu", "top-cpu", "%",
                                       min_history_days, as_json);
         }
-        return run_check_generic(db_path, "thermal.cpu_temp_celsius", "thermal", "thermal", "C",
-                                  min_history_days, as_json);
+        if (command == "check-thermal") {
+            return run_check_generic(db_path, "thermal.cpu_temp_celsius", "thermal", "thermal", "C",
+                                      min_history_days, as_json);
+        }
+        return run_check_generic(db_path, "thermal.fan_rpm", "fan", "fan", " rpm", min_history_days,
+                                  as_json);
     }
 
     std::cerr << "unknown command: " << command << "\n";

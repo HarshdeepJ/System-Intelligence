@@ -143,14 +143,22 @@ std::vector<GpuState> NvmlProvider::collect() {
         }
 
         if (g_nvmlDeviceGetComputeRunningProcesses_v3) {
-            // Guess a generously-sized buffer rather than doing NVML's
-            // documented two-call "ask for the size first" dance -- simpler,
-            // and if a machine somehow has more than 64 GPU processes we
-            // just skip attribution for the overflow rather than retrying.
+            // Guess a generously-sized buffer rather than always doing
+            // NVML's documented two-call "ask for the size first" dance --
+            // simpler, and right in the overwhelmingly common case (a
+            // handful of GPU processes). If a machine genuinely has more
+            // than 64, NVML reports NVML_ERROR_INSUFFICIENT_SIZE and writes
+            // the real count into proc_count without touching the buffer;
+            // retry once with a correctly-sized one rather than dropping
+            // every process the first guess missed.
             unsigned int proc_count = 64;
             std::vector<nvmlProcessInfo_t> infos(proc_count);
             nvmlReturn_t rc =
                 g_nvmlDeviceGetComputeRunningProcesses_v3(device, &proc_count, infos.data());
+            if (rc == kNvmlErrorInsufficientSize && proc_count > 0) {
+                infos.assign(proc_count, nvmlProcessInfo_t{});
+                rc = g_nvmlDeviceGetComputeRunningProcesses_v3(device, &proc_count, infos.data());
+            }
             if (rc == kNvmlSuccess) {
                 infos.resize(proc_count);
                 for (const auto& info : infos) {

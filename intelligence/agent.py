@@ -256,6 +256,18 @@ _DOMAINS: dict[str, _DomainConfig] = {
         # out.
         action_reason_label="elevated temperature",
     ),
+    "fan": _DomainConfig(
+        check_method="get_fan_anomaly_status",
+        cli_name="fan",
+        label="fan speed",
+        unit=" rpm",
+        # Same causal story as thermal -- a fan spinning up is a response to
+        # heat, so the same CPU/GPU-correlated candidates apply. Reuses
+        # _THERMAL_HYPOTHESES rather than defining a near-identical set.
+        hypotheses=_THERMAL_HYPOTHESES,
+        cpu_workload_hypothesis_id="H1",
+        action_reason_label="elevated fan speed",
+    ),
 }
 
 

@@ -110,6 +110,9 @@ class SysIntelClient:
     def get_thermal_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
         return self._get_anomaly_status("check-thermal", min_history_days)
 
+    def get_fan_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
+        return self._get_anomaly_status("check-fan", min_history_days)
+
     def get_top_processes_by_cpu(self, limit: int = 8) -> list[ProcessCpuInfo]:
         """A live query, not `--db`-backed like the anomaly-status methods --
         mirrors the CLI's own `top-cpu` debug command, which takes ~1s (PDH's

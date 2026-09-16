@@ -132,11 +132,16 @@ namespace {
 // debug_enumerate_overlay_schemes()), NOT the classic GUID_MAX_POWER_SAVINGS
 // scheme-template constants -- an earlier version of this code assumed
 // those were reused here, which live testing on this machine disproved.
-// kBestPowerEfficiency's mapping is cross-checked: it's the exact GUID
-// PowerGetUserConfiguredDCPowerMode() returned live on this laptop, and
-// Windows reported that same GUID's friendly name as "Better Battery-life
-// Overlay". kBestPerformance is inferred from its name ("Max Performance
-// Overlay") but has not had the same live cross-check.
+// Both mappings are now live-cross-checked the same way: kBestPowerEfficiency
+// is the exact GUID PowerGetUserConfiguredDCPowerMode() returned while the
+// slider was actually on "Best power efficiency," and kBestPerformance is
+// the exact GUID it returned after this code itself called
+// PowerSetUserConfiguredDCPowerMode(kOverlayBestPerformance) and Windows'
+// own overlay enumeration confirmed that GUID's friendly name is "Max
+// Performance Overlay" -- not just inferred from the name matching by eye.
+// (Verified via `act change-power-mode --level best_performance`, confirmed
+// with `power-schemes`, then rolled back to restore the machine's original
+// setting -- see git history for this comment's change.)
 constexpr GUID kOverlayBestPowerEfficiency = {
     0x961CC777, 0x2547, 0x4F9D, {0x81, 0x74, 0x7D, 0x86, 0x18, 0x1B, 0x8A, 0x7A}};
 constexpr GUID kOverlayBestPerformance = {

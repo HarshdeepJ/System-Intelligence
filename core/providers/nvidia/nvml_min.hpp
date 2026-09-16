@@ -16,6 +16,11 @@ namespace sysintel::nvml {
 
 using nvmlReturn_t = int;
 constexpr nvmlReturn_t kNvmlSuccess = 0;
+// Returned when a caller-provided buffer (e.g. for process enumeration) is
+// too small; NVML writes the actually-required count into the out-param
+// without filling the buffer, so a caller can retry once with a buffer
+// sized to fit.
+constexpr nvmlReturn_t kNvmlErrorInsufficientSize = 7;
 
 using nvmlDevice_t = void*;
 

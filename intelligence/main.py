@@ -131,6 +131,7 @@ _DIAGNOSE_COMMANDS: dict[str, tuple[str, str]] = {
     "diagnose-disk": ("disk", "Investigate a disk I/O anomaly"),
     "diagnose-top-cpu": ("top_cpu", "Investigate a single process monopolizing the CPU"),
     "diagnose-thermal": ("thermal", "Investigate an elevated CPU temperature"),
+    "diagnose-fan": ("fan", "Investigate an elevated fan speed"),
 }
 
 
