@@ -12,10 +12,10 @@ This repo now spans two runtimes:
 
 **A C++ CLI** (`core/`, still no AI involved — everything here is plain statistics, not a model):
 - `sysintel status` — one-shot snapshot (Phase 1: prove we can read real data from Windows)
-- `sysintel record` — continuously samples battery/CPU/memory and stores it in SQLite (Phase 2: history)
+- `sysintel record` — continuously samples battery/CPU/memory/network/disk and stores it in SQLite (Phase 2: history; network/disk added in Phase 9)
 - `sysintel history <metric> --last <minutes>` — reads back min/avg/max over a time window
-- `sysintel check-battery` / `check-memory` / `check-cpu` — runs one anomaly check right now for that domain and prints the result (Phase 3 for battery; memory/cpu generalized in Phase 7)
-- `sysintel watch` — `record` plus a battery + memory + cpu anomaly check every 60 seconds, in one long-running loop (Phase 3, extended in Phase 7)
+- `sysintel check-battery` / `check-memory` / `check-cpu` / `check-network` / `check-disk` — runs one anomaly check right now for that domain and prints the result (Phase 3 for battery; memory/cpu generalized in Phase 7; network/disk in Phase 9)
+- `sysintel watch` — `record` plus a battery + memory + cpu + network + disk anomaly check every 60 seconds, in one long-running loop (Phase 3, extended in Phase 7 and Phase 9)
 - `sysintel inspect [--db path]` — one unified snapshot: hardware inventory, live GPU state, and (with `--db`) recent events (Phase 3.5)
 - `sysintel events [--last minutes]` — process start/stop and AC connect/disconnect events, synthesized from the recorder without needing ETW
 - `sysintel act change-power-mode --level <best_power_efficiency|best_performance> [--reason "..."] [--yes]` — the first safe, reversible action: switches Windows 11's battery Power Mode, gated behind an explicit `--yes` (Phase 5)
@@ -65,7 +65,28 @@ Fans
   Cooling Device  unavailable
 ```
 
-Not yet done: none of these four feed into history/anomaly detection yet (only live state, like GPU), and the Python diagnostic agent still can't see any of them. That, plus generalizing diagnosis itself beyond battery, remains the next slice.
+Not yet done (as of Phase 8): none of these four feed into history/anomaly detection yet (only live state, like GPU), and the Python diagnostic agent still can't see any of them. Phase 9 closes that gap for network and disk; per-process CPU and thermal/fan remain live-state only (see below for why).
+
+### Phase 9: network and disk join history/anomaly detection
+
+The natural next step after Phase 8 landed the collectors: network and disk I/O are each already a single scalar rate (`network.total_bytes_per_sec`, `disk.total_bytes_per_sec`) once summed across adapters/disks, so they slot into the exact same generic `AnomalyDetector` that Phase 7 built for memory/CPU — no new detection logic needed, only wiring.
+
+`Sampler::run()` gains a network and a disk sampling branch alongside the existing battery/memory/CPU ones, each on the same 5-second interval and each recording three metrics: sent/received (or read/write) separately, plus a combined total. The total is what gets baselined and alerted on — for anomaly purposes "is there unusual activity at all" matters more than which direction, and one combined metric avoids standing up two incident domains for what's really one collector each. The per-direction numbers are still recorded for `history`/manual inspection, just not checked for anomalies.
+
+`check-network` and `check-disk` follow the exact `check-memory`/`check-cpu` pattern (thin calls into `run_check_generic`), and `watch` now runs all five domain checks every 60 seconds.
+
+Per-process CPU and thermal/fan deliberately stay live-state-only: per-process CPU has no single metric to baseline (it's a ranked list of many short-lived instances, not one time series), and thermal was already found `unsupported`/`unavailable` on this hardware in Phase 8 — nothing to baseline against. Both remain exactly where GPU state already sits.
+
+```text
+$ sysintel check-network --db sysintel.db
+Not enough history yet to evaluate network anomalies.
+
+$ sysintel watch --db sysintel.db
+Watching battery/CPU/memory/network/disk (recording + anomaly checks) -- Ctrl+C to stop
+Anomaly baseline requires 14 day(s) of accumulated history.
+```
+
+Not yet done: the Python diagnostic agent still can't see network or disk (`get_battery_anomaly_status()` is still the only anomaly-status tool); generalizing the agent itself beyond battery — for any domain — remains the next slice.
 
 ### Phase 7: one detector, three domains — the start of "diagnose everything"
 

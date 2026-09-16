@@ -414,7 +414,7 @@ BOOL WINAPI console_ctrl_handler(DWORD /*ctrl_type*/) {
 }
 
 int run_record(const std::string& db_path) {
-    std::cout << "Recording battery/CPU/memory samples to " << db_path
+    std::cout << "Recording battery/CPU/memory/network/disk samples to " << db_path
                << " (Ctrl+C to stop)...\n";
 
     SqliteStore store(db_path);
@@ -786,7 +786,8 @@ int run_check_generic(const std::string& db_path, const std::string& metric,
 }
 
 int run_watch(const std::string& db_path, int min_history_days) {
-    std::cout << "Watching battery/CPU/memory (recording + anomaly checks) -- Ctrl+C to stop\n";
+    std::cout << "Watching battery/CPU/memory/network/disk (recording + anomaly checks) -- "
+                 "Ctrl+C to stop\n";
     std::cout << "Anomaly baseline requires " << min_history_days
                << " day(s) of accumulated history.\n\n";
 
@@ -811,6 +812,18 @@ int run_watch(const std::string& db_path, int min_history_days) {
     cpu_config.min_history_days = min_history_days;
     AnomalyDetector cpu_detector(store, cpu_config);
 
+    AnomalyDetectorConfig network_config;
+    network_config.metric = "network.total_bytes_per_sec";
+    network_config.domain = "network";
+    network_config.min_history_days = min_history_days;
+    AnomalyDetector network_detector(store, network_config);
+
+    AnomalyDetectorConfig disk_config;
+    disk_config.metric = "disk.total_bytes_per_sec";
+    disk_config.domain = "disk";
+    disk_config.min_history_days = min_history_days;
+    AnomalyDetector disk_detector(store, disk_config);
+
     sampler.set_periodic_hook(std::chrono::seconds(60), [&]() {
         std::cout << "[watch] ";
         print_check_report(battery_detector.check());
@@ -818,6 +831,10 @@ int run_watch(const std::string& db_path, int min_history_days) {
         print_generic_check_report("memory", "%", memory_detector.check());
         std::cout << "[watch] ";
         print_generic_check_report("cpu", "%", cpu_detector.check());
+        std::cout << "[watch] ";
+        print_generic_check_report("network", " B/s", network_detector.check());
+        std::cout << "[watch] ";
+        print_generic_check_report("disk", " B/s", disk_detector.check());
     });
 
     sampler.run();
@@ -840,7 +857,9 @@ void print_usage() {
                << "  sysintel actions [--last <n>] [--db <path>]\n"
                << "  sysintel check-battery [--db <path>] [--min-history-days <n>] [--json]\n"
                << "  sysintel check-memory [--db <path>] [--min-history-days <n>] [--json]\n"
-               << "  sysintel check-cpu [--db <path>] [--min-history-days <n>] [--json]\n";
+               << "  sysintel check-cpu [--db <path>] [--min-history-days <n>] [--json]\n"
+               << "  sysintel check-network [--db <path>] [--min-history-days <n>] [--json]\n"
+               << "  sysintel check-disk [--db <path>] [--min-history-days <n>] [--json]\n";
 }
 
 }  // namespace
@@ -1031,7 +1050,8 @@ int main(int argc, char** argv) {
                                    : run_check_battery(db_path, min_history_days, as_json);
     }
 
-    if (command == "check-memory" || command == "check-cpu") {
+    if (command == "check-memory" || command == "check-cpu" || command == "check-network" ||
+        command == "check-disk") {
         std::string db_path = "sysintel.db";
         int min_history_days = 14;
         bool as_json = false;
@@ -1049,8 +1069,16 @@ int main(int argc, char** argv) {
             return run_check_generic(db_path, "memory.load_percent", "memory", "memory", "%",
                                       min_history_days, as_json);
         }
-        return run_check_generic(db_path, "cpu.utilization", "cpu", "cpu", "%", min_history_days,
-                                  as_json);
+        if (command == "check-cpu") {
+            return run_check_generic(db_path, "cpu.utilization", "cpu", "cpu", "%",
+                                      min_history_days, as_json);
+        }
+        if (command == "check-network") {
+            return run_check_generic(db_path, "network.total_bytes_per_sec", "network", "network",
+                                      " B/s", min_history_days, as_json);
+        }
+        return run_check_generic(db_path, "disk.total_bytes_per_sec", "disk", "disk", " B/s",
+                                  min_history_days, as_json);
     }
 
     std::cerr << "unknown command: " << command << "\n";
