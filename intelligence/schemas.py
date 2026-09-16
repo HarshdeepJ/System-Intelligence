@@ -59,6 +59,12 @@ class ProcessInfo(BaseModel):
     working_set_bytes: int
 
 
+class ProcessCpuInfo(BaseModel):
+    pid: int
+    name: str
+    cpu_percent: float
+
+
 class SystemSnapshot(BaseModel):
     battery: BatterySnapshot
     cpu: CpuSnapshot

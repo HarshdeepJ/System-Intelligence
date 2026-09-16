@@ -184,9 +184,28 @@ int run_thermal() {
     return 0;
 }
 
-int run_top_cpu() {
-    std::cout << "(sampling for 1 second...)\r" << std::flush;
-    auto processes = get_top_processes_by_cpu(8);
+int run_top_cpu(int limit, bool as_json) {
+    if (!as_json) {
+        std::cout << "(sampling for 1 second...)\r" << std::flush;
+    }
+    auto processes = get_top_processes_by_cpu(limit);
+
+    if (as_json) {
+        std::ostringstream out;
+        out << "[";
+        for (size_t i = 0; i < processes.size(); ++i) {
+            if (i > 0) {
+                out << ",";
+            }
+            const auto& p = processes[i];
+            out << "{\"pid\":" << p.pid << ",\"name\":\"" << json_escape(p.name)
+                << "\",\"cpu_percent\":" << json_num(p.cpu_percent) << "}";
+        }
+        out << "]";
+        std::cout << out.str() << std::endl;
+        return 0;
+    }
+
     std::cout << "Top processes by CPU              \n\n";
     for (const auto& p : processes) {
         std::cout << "  " << std::left << std::setw(20) << p.name << std::right << std::fixed
@@ -568,6 +587,25 @@ int run_act_change_power_mode(const std::string& db_path, const std::string& lev
     return 0;
 }
 
+int run_act_suspend_process(const std::string& db_path, const std::string& pid,
+                             const std::string& reason, bool approved, bool as_json) {
+    SqliteStore store(db_path);
+    ActionBroker broker(store);
+
+    ActionRequest request;
+    request.action_type = "suspend_process";
+    request.reason = reason;
+    request.params["pid"] = pid;
+
+    ActionOutcome outcome = broker.execute(request, approved);
+    if (as_json) {
+        std::cout << json_action_outcome(outcome) << std::endl;
+    } else {
+        print_action_outcome(outcome);
+    }
+    return 0;
+}
+
 int run_act_rollback(const std::string& db_path, const std::string& action_id, bool approved,
                       bool as_json) {
     SqliteStore store(db_path);
@@ -869,6 +907,7 @@ void print_usage() {
                << "  sysintel events [--last <minutes>] [--limit <n>] [--db <path>] [--json]\n"
                << "  sysintel act change-power-mode --level <best_power_efficiency|best_performance> "
                   "[--reason <text>] [--db <path>] [--yes]\n"
+               << "  sysintel act suspend-process <pid> [--reason <text>] [--db <path>] [--yes]\n"
                << "  sysintel act rollback <action-id> [--db <path>] [--yes]\n"
                << "  sysintel actions [--last <n>] [--db <path>]\n"
                << "  sysintel check-battery [--db <path>] [--min-history-days <n>] [--json]\n"
@@ -899,7 +938,17 @@ int main(int argc, char** argv) {
     }
 
     if (command == "top-cpu") {
-        return run_top_cpu();
+        int limit = 8;
+        bool as_json = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--limit" && i + 1 < argc) {
+                limit = std::stoi(argv[++i]);
+            } else if (arg == "--json") {
+                as_json = true;
+            }
+        }
+        return run_top_cpu(limit, as_json);
     }
 
     if (command == "thermal") {
@@ -1008,6 +1057,30 @@ int main(int argc, char** argv) {
                 return 1;
             }
             return run_act_change_power_mode(db_path, level, reason, approved, as_json);
+        }
+
+        if (subcommand == "suspend-process") {
+            if (argc < 4) {
+                std::cerr << "usage: sysintel act suspend-process <pid> [--reason <text>] "
+                             "[--db <path>] [--yes] [--json]\n";
+                return 1;
+            }
+            std::string pid = argv[3];
+            std::string reason = "manual";
+            bool as_json = false;
+            for (int i = 4; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--reason" && i + 1 < argc) {
+                    reason = argv[++i];
+                } else if (arg == "--db" && i + 1 < argc) {
+                    db_path = argv[++i];
+                } else if (arg == "--yes") {
+                    approved = true;
+                } else if (arg == "--json") {
+                    as_json = true;
+                }
+            }
+            return run_act_suspend_process(db_path, pid, reason, approved, as_json);
         }
 
         if (subcommand == "rollback") {

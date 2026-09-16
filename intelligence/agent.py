@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from . import llm
-from .schemas import BatteryCheckReport, Incident
+from .schemas import BatteryCheckReport, Incident, ProcessCpuInfo
 from .tools import SysIntelClient
 
 
@@ -169,12 +169,17 @@ class _DomainConfig:
     # Which hypothesis ID means "system-wide CPU workload correlates" -- None where that
     # would be circular (the cpu domain itself) or where a domain doesn't offer it.
     cpu_workload_hypothesis_id: Optional[str]
-    # Text used in a suggested action's `reason` (e.g. "battery drain anomaly: ..."). None
-    # means this domain doesn't offer a suggested action at all: the Action Broker's only
-    # capability, change_power_mode, is a genuine lever on CPU/GPU power draw (hence
-    # battery and cpu), but not a real fix for a memory leak or elevated network/disk I/O --
-    # offering it there would overstate what this agent can actually do.
+    # Text used in change_power_mode's suggested-action `reason` (e.g. "battery drain
+    # anomaly: ..."). None means this domain doesn't offer that action: it's a genuine
+    # lever on CPU/GPU power draw (hence battery, cpu, thermal), but not a real fix for a
+    # memory leak or elevated network/disk I/O -- offering it there would overstate what
+    # this agent can actually do. Mutually exclusive with offers_suspend_action below.
     action_reason_label: Optional[str]
+    # True only for top_cpu: unlike every other domain, this one's evidence identifies an
+    # actual culprit process (the single busiest one, queried fresh at suggestion time via
+    # get_top_processes_by_cpu()), so it gets the more targeted suspend_process action
+    # instead of the general change_power_mode lever.
+    offers_suspend_action: bool = False
 
 
 _DOMAINS: dict[str, _DomainConfig] = {
@@ -230,11 +235,8 @@ _DOMAINS: dict[str, _DomainConfig] = {
         unit="%",
         hypotheses=_RESOURCE_HYPOTHESES,
         cpu_workload_hypothesis_id="H1",
-        # Unlike memory/network/disk, throttling CPU/GPU power draw directly
-        # addresses "one process is monopolizing the CPU" -- the same lever
-        # the cpu domain uses, just triggered by a per-process signal instead
-        # of the system-wide total.
-        action_reason_label="runaway process CPU load",
+        action_reason_label=None,
+        offers_suspend_action=True,
     ),
     "thermal": _DomainConfig(
         check_method="get_thermal_anomaly_status",
@@ -259,7 +261,7 @@ def _sentence_case(label: str) -> str:
 
 
 def _build_suggested_action(reason_label: str, live_mean: float, baseline_mean: float, unit: str) -> SuggestedAction:
-    """The one action this project can currently take, offered whenever
+    """The general-purpose action this project can take, offered whenever
     there's an open/ongoing anomaly in a domain the Action Broker's lever
     actually addresses: Best Power Efficiency mode reduces both CPU- and
     GPU-adjacent power draw at the OS level, so it's a reasonable, fully-
@@ -273,6 +275,35 @@ def _build_suggested_action(reason_label: str, live_mean: float, baseline_mean: 
     )
 
 
+# Kept in sync by hand with protected_process_names() in
+# core/actions/action_broker.cpp -- the C++ side is the actual enforcement
+# (it refuses these regardless of what this agent suggests), but suggesting
+# one anyway would just hand the user a prompt that's guaranteed to fail,
+# so this list lets the suggestion step skip them instead.
+_PROTECTED_PROCESS_NAMES = {
+    "system", "system idle process", "registry", "smss.exe", "csrss.exe",
+    "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "svchost.exe",
+    "explorer.exe", "sysintel.exe",
+}
+
+
+def _build_suspend_action(proc: ProcessCpuInfo) -> SuggestedAction:
+    """The targeted second action: pause the specific process that's
+    actually monopolizing the CPU, rather than the blunter system-wide
+    power-mode lever. Suspend, never terminate -- resumable exactly as it
+    was via rollback_action(), so this stays a safe, reversible action even
+    though it's aimed at one process instead of the whole machine."""
+    return SuggestedAction(
+        action_type="suspend_process",
+        params={"pid": str(proc.pid)},
+        reason=f"runaway process CPU load: {proc.name} (pid {proc.pid}) at {proc.cpu_percent:.1f}%",
+        description=(
+            f"Suspend '{proc.name}' (pid {proc.pid}) -- pauses it without closing it; "
+            "resume anytime with the action's rollback"
+        ),
+    )
+
+
 class DiagnosticAgent:
     def __init__(self, tools: SysIntelClient, domain: str, min_history_days: int = 14):
         if domain not in _DOMAINS:
@@ -283,6 +314,21 @@ class DiagnosticAgent:
         self._config = _DOMAINS[domain]
 
     def _maybe_action(self, norm: _NormalizedCheck) -> SuggestedAction | None:
+        if self._config.offers_suspend_action:
+            # Queried fresh, not from the evidence already gathered: by the
+            # time a diagnosis reaches this point the LLM call may have taken
+            # several seconds, so "who's the top process right now" is a more
+            # honest target to suspend than "who was the top process when
+            # evidence was collected." Asks for a few candidates, not just
+            # one, since the single busiest process is quite often something
+            # like "System" or "Memory Compression" that's protected and
+            # would just be refused -- skip those rather than suggest
+            # something guaranteed to fail.
+            candidates = self.tools.get_top_processes_by_cpu(limit=5)
+            for proc in candidates:
+                if proc.name.lower() not in _PROTECTED_PROCESS_NAMES:
+                    return _build_suspend_action(proc)
+            return None
         if self._config.action_reason_label is None:
             return None
         return _build_suggested_action(

@@ -21,6 +21,7 @@ from .schemas import (
     BatteryCheckReport,
     EventsResult,
     MetricHistory,
+    ProcessCpuInfo,
     SystemSnapshot,
 )
 
@@ -34,7 +35,7 @@ class SysIntelClient:
         self._exe = str(sysintel_exe)
         self._db = str(db_path)
 
-    def _run(self, *args: str) -> dict:
+    def _run(self, *args: str):
         try:
             result = subprocess.run(
                 [self._exe, *args],
@@ -109,6 +110,15 @@ class SysIntelClient:
     def get_thermal_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
         return self._get_anomaly_status("check-thermal", min_history_days)
 
+    def get_top_processes_by_cpu(self, limit: int = 8) -> list[ProcessCpuInfo]:
+        """A live query, not `--db`-backed like the anomaly-status methods --
+        mirrors the CLI's own `top-cpu` debug command, which takes ~1s (PDH's
+        two-sample rate trick, same as the total CPU collector)."""
+        return [
+            ProcessCpuInfo.model_validate(p)
+            for p in self._run("top-cpu", "--limit", str(limit), "--json")
+        ]
+
     def get_recent_events(self, last_minutes: int = 60, limit: int = 50) -> EventsResult:
         return EventsResult.model_validate(
             self._run(
@@ -136,6 +146,25 @@ class SysIntelClient:
             "change-power-mode",
             "--level",
             level,
+            "--reason",
+            reason,
+            "--db",
+            self._db,
+            "--json",
+        ]
+        if approved:
+            args.append("--yes")
+        return ActionOutcome.model_validate(self._run(*args))
+
+    def apply_suspend_process(self, pid: str, reason: str, approved: bool = True) -> ActionOutcome:
+        """The second action this agent can take -- suspends (not
+        terminates) a process, so it can always be undone via
+        rollback_action(). See core/actions/process_control.hpp for why
+        suspend rather than terminate was the deliberate choice here."""
+        args = [
+            "act",
+            "suspend-process",
+            str(pid),
             "--reason",
             reason,
             "--db",

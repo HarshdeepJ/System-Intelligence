@@ -86,15 +86,34 @@ def handle_suggested_action(
         approved = answer == "y"
 
     if not approved:
-        level = action.params.get("level", "")
         print("Not applied. Run it yourself later with:")
-        print(f'  sysintel act change-power-mode --level {level} --reason "{action.reason}" --yes')
+        print(f"  {_equivalent_cli_command(action)}")
         return
 
-    outcome = tools.apply_change_power_mode(
-        level=action.params["level"], reason=action.reason, approved=True
-    )
+    if action.action_type == "change_power_mode":
+        outcome = tools.apply_change_power_mode(
+            level=action.params["level"], reason=action.reason, approved=True
+        )
+    elif action.action_type == "suspend_process":
+        outcome = tools.apply_suspend_process(
+            pid=action.params["pid"], reason=action.reason, approved=True
+        )
+    else:
+        raise ValueError(f"no CLI handler wired up for action_type {action.action_type!r}")
     print_action_outcome(outcome)
+
+
+def _equivalent_cli_command(action) -> str:
+    """The exact `sysintel act ...` invocation declining the prompt still
+    leaves runnable -- one branch per action_type, mirroring
+    handle_suggested_action's own dispatch above."""
+    if action.action_type == "change_power_mode":
+        level = action.params.get("level", "")
+        return f'sysintel act change-power-mode --level {level} --reason "{action.reason}" --yes'
+    if action.action_type == "suspend_process":
+        pid = action.params.get("pid", "")
+        return f'sysintel act suspend-process {pid} --reason "{action.reason}" --yes'
+    return f"sysintel act <unknown action_type {action.action_type!r}>"
 
 
 def default_sysintel_exe() -> str:

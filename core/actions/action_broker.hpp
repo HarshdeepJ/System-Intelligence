@@ -7,7 +7,7 @@
 namespace sysintel {
 
 struct ActionRequest {
-    std::string action_type;  // currently only "change_power_mode" is recognized
+    std::string action_type;  // "change_power_mode" or "suspend_process"
     std::string reason;
     std::unordered_map<std::string, std::string> params;
 };
@@ -46,6 +46,14 @@ private:
     SqliteStore& store_;
 
     ActionOutcome handle_change_power_mode(const ActionRequest& request, bool approved);
+    ActionOutcome handle_suspend_process(const ActionRequest& request, bool approved);
+
+    ActionOutcome rollback_change_power_mode(const std::string& action_id,
+                                              const ActionRecord& record, bool approved);
+    ActionOutcome rollback_suspend_process(const std::string& action_id, const ActionRecord& record,
+                                            bool approved);
+    void record_rollback_audit(const std::string& action_id, const std::string& original_type,
+                                const std::string& previous_state, const std::string& new_state);
 };
 
 }  // namespace sysintel
