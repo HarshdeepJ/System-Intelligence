@@ -12,10 +12,10 @@ This repo now spans two runtimes:
 
 **A C++ CLI** (`core/`, still no AI involved — everything here is plain statistics, not a model):
 - `sysintel status` — one-shot snapshot (Phase 1: prove we can read real data from Windows)
-- `sysintel record` — continuously samples battery/CPU/memory/network/disk and stores it in SQLite (Phase 2: history; network/disk added in Phase 9)
+- `sysintel record` — continuously samples battery/CPU/memory/network/disk/top-process-CPU/thermal and stores it in SQLite (Phase 2: history; network/disk added in Phase 9, top-process-CPU/thermal in Phase 11)
 - `sysintel history <metric> --last <minutes>` — reads back min/avg/max over a time window
-- `sysintel check-battery` / `check-memory` / `check-cpu` / `check-network` / `check-disk` — runs one anomaly check right now for that domain and prints the result (Phase 3 for battery; memory/cpu generalized in Phase 7; network/disk in Phase 9)
-- `sysintel watch` — `record` plus a battery + memory + cpu + network + disk anomaly check every 60 seconds, in one long-running loop (Phase 3, extended in Phase 7 and Phase 9)
+- `sysintel check-battery` / `check-memory` / `check-cpu` / `check-network` / `check-disk` / `check-top-cpu` / `check-thermal` — runs one anomaly check right now for that domain and prints the result (Phase 3 for battery; memory/cpu generalized in Phase 7; network/disk in Phase 9; top-cpu/thermal in Phase 11)
+- `sysintel watch` — `record` plus an anomaly check for all seven domains every 60 seconds, in one long-running loop (Phase 3, extended in Phase 7, Phase 9, and Phase 11)
 - `sysintel inspect [--db path]` — one unified snapshot: hardware inventory, live GPU state, and (with `--db`) recent events (Phase 3.5)
 - `sysintel events [--last minutes]` — process start/stop and AC connect/disconnect events, synthesized from the recorder without needing ETW
 - `sysintel act change-power-mode --level <best_power_efficiency|best_performance> [--reason "..."] [--yes]` — the first safe, reversible action: switches Windows 11's battery Power Mode, gated behind an explicit `--yes` (Phase 5)
@@ -28,8 +28,8 @@ This repo now spans two runtimes:
 - `sysintel thermal` — CPU thermal zone temperature and fan RPM, best-effort (Phase 8)
 - every command above also takes `--json` for machine-readable output
 
-**A Python reasoning agent** (`intelligence/`, Phase 4 — real LLM reasoning via Groq, Phase 6 closes the loop into an actual action, Phase 10 generalizes it beyond battery):
-- `diagnose-battery` / `diagnose-memory` / `diagnose-cpu` / `diagnose-network` / `diagnose-disk` `[--auto-approve] [--no-act]` — investigates an open anomaly in that domain: collects evidence via the CLI's `--json` output, sends it to an LLM for hypothesis selection, prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format, and — for battery/cpu, unless `--no-act` — offers a concrete, runnable action with an interactive approval prompt (or applies it automatically with `--auto-approve`)
+**A Python reasoning agent** (`intelligence/`, Phase 4 — real LLM reasoning via Groq, Phase 6 closes the loop into an actual action, Phase 10 generalizes it beyond battery, Phase 11 extends that to all seven domains):
+- `diagnose-battery` / `diagnose-memory` / `diagnose-cpu` / `diagnose-network` / `diagnose-disk` / `diagnose-top-cpu` / `diagnose-thermal` `[--auto-approve] [--no-act]` — investigates an open anomaly in that domain: collects evidence via the CLI's `--json` output, sends it to an LLM for hypothesis selection, prints an evidence-based diagnosis in the PRD's Finding/Confidence/Evidence/Alternatives/Recommendation format, and — for battery/cpu/top-cpu/thermal, unless `--no-act` — offers a concrete, runnable action with an interactive approval prompt (or applies it automatically with `--auto-approve`)
 
 Everything else (the native UI and AMD/Intel GPU telemetry) is designed but not built, and will sit on top of this same collector + storage + detector + tool-client code without needing to change it.
 
@@ -119,7 +119,37 @@ Recommended action
 
 Verified against seeded synthetic anomalies for cpu, battery, and network independently (a 500-sample baseline plus a spiked live window, inserted directly into `metric_samples`) -- each correctly detected, diagnosed through the rule-based fallback (no `GROQ_API_KEY` in this environment), and the cpu domain correctly skipped the circular "CPU workload" branch entirely rather than reasoning about it. Battery's suggested-action `reason` string came out byte-for-byte identical to the pre-refactor wording (`"battery drain anomaly: 22.0W vs 8.3W baseline"`), confirming the generalization didn't regress the one path that was already validated.
 
-Not yet done: the fallback's rule-based reasoning is still shallow (one CPU-correlation check, nothing about candidate processes or GPU) -- exactly as it was for battery before this phase, just now shared. The `native UI` and AMD/Intel GPU telemetry remain the next layers after that.
+Not yet done (as of Phase 10): the fallback's rule-based reasoning is still shallow (one CPU-correlation check, nothing about candidate processes or GPU) -- exactly as it was for battery before this phase, just now shared. Per-process CPU and thermal/fan (Phase 8's other two collectors) still weren't wired into detection at all. Phase 11 closes that second gap.
+
+### Phase 11: per-process CPU and thermal join the loop too
+
+Phase 9 left per-process CPU and thermal/fan out specifically because neither reduces to one scalar time series as cleanly as network/disk did -- per-process CPU is a ranked list of many short-lived instances, and thermal covers two different physical quantities (temperature, fan speed). Both turned out to have a real scalar worth baselining once framed narrowly enough, rather than needing a fundamentally different detection mechanism:
+
+- **Per-process CPU** (`process.top_cpu_percent`) -- not "every process's CPU," just the single busiest process's CPU% each tick. That's a genuinely different signal from `cpu.utilization` (the system-wide total): a runaway process can spike this while the system stays moderately loaded, or a broadly busy system can spike the total without any one process standing out. `check-top-cpu` and `watch` reuse the same `AnomalyDetector` as everything else, keyed on a `"top_cpu"` domain.
+- **Thermal** (`thermal.cpu_temp_celsius`, `thermal.fan_rpm`) -- recorded as the *maximum* across all zones/fans that actually report a value, and only when at least one does. On hardware where thermal is `unsupported`/`unavailable` (this machine, per Phase 8's own findings), this simply records nothing, the same honest absence `battery.discharge_watts` already models while on AC power. Temperature is what `check-thermal` evaluates for anomalies; fan RPM is recorded for `history` but not checked on its own, the same "record more than you check" pattern network/disk's per-direction numbers already used.
+
+`SysIntelClient` gained `get_top_cpu_anomaly_status()` and `get_thermal_anomaly_status()`, and `agent.py`'s `_DOMAINS` table gained matching entries -- `top_cpu` reuses the existing three-domain `_RESOURCE_HYPOTHESES` set (system-wide CPU load and top-process CPU are different-enough metrics that "is the total also elevated" is real evidence, not circular the way it would be for the cpu domain itself), while `thermal` gets its own set pairing CPU- and GPU-correlated heat, matching the physical reality that both are real heat sources. Both offer the `change_power_mode` suggested action (throttling directly addresses a runaway process, and is arguably the single most on-the-nose use of that action for elevated temperature), so `main.py` gained `diagnose-top-cpu` and `diagnose-thermal` alongside the other five.
+
+One real bug caught while wiring this up: the evidence lines for "not enough history" / "no active anomaly" built their check-subcommand name as `f"check-{self.domain}"`, which is correct for every domain except `top_cpu` -- the CLI command is hyphenated (`check-top-cpu`), not underscored. `_DomainConfig` gained a `cli_name` field to carry the CLI's actual spelling instead of assuming it matches the Python-identifier-friendly domain key.
+
+```text
+$ intelligence diagnose-top-cpu --min-history-days 1 --no-act
+Finding
+  System-wide CPU workload is correlated with the anomaly
+Evidence
+  - top process's CPU usage: 95.0% observed vs 13.65% baseline (threshold 42.54%)
+  - CPU utilization: 80.0% now vs 16.3% (24h average)
+
+$ intelligence diagnose-thermal --min-history-days 1 --no-act
+Finding
+  System-wide CPU workload is correlated with the temperature rise
+Evidence
+  - CPU temperature: 92.0C observed vs 45.81C baseline (threshold 68.72C)
+```
+
+Verified the same way as Phase 10: seeded synthetic anomalies for both `process.top_cpu_percent` and `thermal.cpu_temp_celsius` directly into `metric_samples`, confirmed `check-top-cpu`/`check-thermal` detect them, and ran both `diagnose-*` commands end-to-end through the rule-based fallback. Also re-ran the battery seeded scenario to confirm still-byte-for-byte-identical output -- no regression from the `_DomainConfig` field addition.
+
+Not yet done: this is now genuinely comprehensive detection coverage across every domain the CLI can observe, but the rule-based fallback's shallowness (flagged in Phase 10) still applies to all seven domains equally, and the Action Broker still has exactly one action. Those, plus the native UI and AMD/Intel GPU telemetry, are what's left.
 
 ### Phase 7: one detector, three domains — the start of "diagnose everything"
 
@@ -777,10 +807,10 @@ No key configured, or the API call fails for any reason? The agent automatically
 
 ## What's next
 
-The stated direction is comprehensive coverage: "all the information, diagnose everything," not just battery. Phase 7 generalized *detection* to three domains; Phase 8 filled the missing collectors; Phase 9 wired network/disk into detection; Phase 10 generalized *diagnosis* to all five checkable domains. What's still not touched:
+The stated direction is comprehensive coverage: "all the information, diagnose everything," not just battery. Phase 7 generalized *detection* to three domains; Phase 8 filled the missing collectors; Phase 9 wired network/disk into detection; Phase 10 generalized *diagnosis* to those five domains; Phase 11 brought per-process CPU and thermal into both. Every domain the CLI can observe now feeds history, anomaly detection, and LLM-backed diagnosis. What's still not touched:
 
-- **Per-process CPU and thermal/fan still don't feed history or anomaly detection.** They remain live-state only, the same place GPU state was left in Phase 3.5 — `sysintel top-cpu`/`thermal` show what's happening right now, but nothing is recorded to SQLite or checked against a baseline. Per-process CPU doesn't reduce to one time series the way network/disk did (it's a ranked list of many short-lived instances), so this isn't a mechanical repeat of Phase 9 — it needs its own design (e.g. alarming per-process, or on the top process's share) rather than a total.
-- **The rule-based fallback is still shallow everywhere, not just for battery.** `_fallback_diagnose()` only ever checks one CPU-correlation threshold; it doesn't reason about candidate processes (gathered as evidence, but only the LLM path actually uses them) or GPU state. Real per-domain diagnosis quality still depends on the LLM being reachable.
-- **A second safe action**, something CPU-drain-specific (e.g. disabling a startup application) rather than only power-mode — once it exists, `_build_suggested_action()` needs real logic for *which* action fits *which* winning hypothesis/domain, instead of every offering domain proposing the same one regardless.
+- **The rule-based fallback is still shallow everywhere.** `_fallback_diagnose()` only ever checks one CPU-correlation threshold; it doesn't reason about candidate processes (gathered as evidence, but only the LLM path actually uses them) or GPU state. Real per-domain diagnosis quality still depends on the LLM being reachable.
+- **A second safe action**, something more targeted than power-mode (e.g. disabling a startup application) — once it exists, `_build_suggested_action()` needs real logic for *which* action fits *which* winning hypothesis/domain, instead of every offering domain proposing the same one regardless.
+- **Fan RPM is recorded but never checked for anomalies** (only CPU temperature is) — a spinning-down or stuck fan is arguably as diagnostically interesting as a hot CPU, but wasn't wired in Phase 11 since "check-thermal" already had a clear primary signal (temperature) and adding a second checked metric per domain would need its own incident-domain naming decision.
 
 Still separately outstanding: the NVML path needs verification on real NVIDIA hardware (everything checkable without it has been); `best_performance`'s GUID mapping wants the same live cross-check `best_power_efficiency` already got; hypothesis-selection confidence is LLM-set (a conscious, documented departure from the tech design's §32 "don't let the LLM invent confidence" principle, which still holds for every deterministic part of this system); and AMD/Intel GPU providers, true ETW-based event tracking, retention/rollup, and the eventual named-pipe IPC all remain deliberately deferred until their absence actually starts costing something.

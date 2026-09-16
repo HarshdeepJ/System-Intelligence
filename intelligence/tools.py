@@ -103,6 +103,12 @@ class SysIntelClient:
     def get_disk_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
         return self._get_anomaly_status("check-disk", min_history_days)
 
+    def get_top_cpu_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
+        return self._get_anomaly_status("check-top-cpu", min_history_days)
+
+    def get_thermal_anomaly_status(self, min_history_days: int = 14) -> AnomalyCheckReport:
+        return self._get_anomaly_status("check-thermal", min_history_days)
+
     def get_recent_events(self, last_minutes: int = 60, limit: int = 50) -> EventsResult:
         return EventsResult.model_validate(
             self._run(

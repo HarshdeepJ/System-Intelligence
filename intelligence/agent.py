@@ -1,5 +1,5 @@
 """The resource-anomaly diagnostic agent, generalized across every domain
-the CLI can check (battery, memory, cpu, network, disk).
+the CLI can check (battery, memory, cpu, network, disk, top_cpu, thermal).
 
 State machine: TRIAGE -> GENERATE HYPOTHESES -> COLLECT EVIDENCE -> EVALUATE
 -> DIAGNOSIS -> EXPLAIN (see tech design's "Agent Architecture").
@@ -123,14 +123,33 @@ _CPU_HYPOTHESES = [
     {"id": "H3", "description": "Unexplained by evidence this agent currently checks"},
 ]
 
-# Shared by memory, network, and disk: none of these have a domain-specific
-# secondary signal the way battery has GPU, so the candidate explanations
-# are the two general-purpose correlates this agent can actually check
-# (system-wide CPU load, a recently-started process) plus honest
-# uncertainty.
+# Shared by memory, network, disk, and top_cpu: none of these have a
+# domain-specific secondary signal the way battery/cpu have GPU, so the
+# candidate explanations are the two general-purpose correlates this agent
+# can actually check (system-wide CPU load, a recently-started process)
+# plus honest uncertainty. This isn't circular for top_cpu the way it would
+# be for cpu itself: process.top_cpu_percent (one process) and
+# cpu.utilization (the whole system) are genuinely different metrics, so
+# asking whether the total is *also* elevated is real evidence, not a
+# restatement.
 _RESOURCE_HYPOTHESES = [
     {"id": "H1", "description": "System-wide CPU workload is correlated with the anomaly"},
     {"id": "H2", "description": "A process that started right before the anomaly is responsible"},
+    {"id": "H3", "description": "Unexplained by evidence this agent currently checks"},
+]
+
+# Thermal gets its own set: an unusual CPU temperature plausibly traces to
+# either CPU or GPU load (a battery-like pairing, since heat is a shared
+# byproduct of both), not to "a process started recently" the way a
+# resource-usage anomaly does -- a process can run hot without anything
+# having started or stopped around the incident.
+_THERMAL_HYPOTHESES = [
+    {"id": "H1", "description": "System-wide CPU workload is correlated with the temperature rise"},
+    {
+        "id": "H2",
+        "description": "GPU activity is correlated with the temperature rise (only meaningful "
+        "when a GPU actually reports usable telemetry)",
+    },
     {"id": "H3", "description": "Unexplained by evidence this agent currently checks"},
 ]
 
@@ -138,6 +157,11 @@ _RESOURCE_HYPOTHESES = [
 @dataclass(frozen=True)
 class _DomainConfig:
     check_method: str  # SysIntelClient method name for this domain's anomaly check
+    # The CLI's check-<cli_name> subcommand name -- equal to the domain key for every
+    # domain except top_cpu (Python-identifier-friendly "top_cpu" vs the CLI's
+    # hyphenated "check-top-cpu"). Used only in prose evidence lines, never to
+    # actually invoke anything.
+    cli_name: str
     label: str  # human-readable headline, e.g. "battery discharge"
     unit: str  # matches the unit string main.cpp prints for this metric (" B/s" has its
     # own leading space, "%"/"W" don't)
@@ -156,6 +180,7 @@ class _DomainConfig:
 _DOMAINS: dict[str, _DomainConfig] = {
     "battery": _DomainConfig(
         check_method="get_battery_anomaly_status",
+        cli_name="battery",
         label="battery discharge",
         unit="W",
         hypotheses=_BATTERY_HYPOTHESES,
@@ -164,6 +189,7 @@ _DOMAINS: dict[str, _DomainConfig] = {
     ),
     "cpu": _DomainConfig(
         check_method="get_cpu_anomaly_status",
+        cli_name="cpu",
         label="CPU utilization",
         unit="%",
         hypotheses=_CPU_HYPOTHESES,
@@ -172,6 +198,7 @@ _DOMAINS: dict[str, _DomainConfig] = {
     ),
     "memory": _DomainConfig(
         check_method="get_memory_anomaly_status",
+        cli_name="memory",
         label="memory load",
         unit="%",
         hypotheses=_RESOURCE_HYPOTHESES,
@@ -180,6 +207,7 @@ _DOMAINS: dict[str, _DomainConfig] = {
     ),
     "network": _DomainConfig(
         check_method="get_network_anomaly_status",
+        cli_name="network",
         label="network throughput",
         unit=" B/s",
         hypotheses=_RESOURCE_HYPOTHESES,
@@ -188,13 +216,46 @@ _DOMAINS: dict[str, _DomainConfig] = {
     ),
     "disk": _DomainConfig(
         check_method="get_disk_anomaly_status",
+        cli_name="disk",
         label="disk I/O throughput",
         unit=" B/s",
         hypotheses=_RESOURCE_HYPOTHESES,
         cpu_workload_hypothesis_id="H1",
         action_reason_label=None,
     ),
+    "top_cpu": _DomainConfig(
+        check_method="get_top_cpu_anomaly_status",
+        cli_name="top-cpu",
+        label="top process's CPU usage",
+        unit="%",
+        hypotheses=_RESOURCE_HYPOTHESES,
+        cpu_workload_hypothesis_id="H1",
+        # Unlike memory/network/disk, throttling CPU/GPU power draw directly
+        # addresses "one process is monopolizing the CPU" -- the same lever
+        # the cpu domain uses, just triggered by a per-process signal instead
+        # of the system-wide total.
+        action_reason_label="runaway process CPU load",
+    ),
+    "thermal": _DomainConfig(
+        check_method="get_thermal_anomaly_status",
+        cli_name="thermal",
+        label="CPU temperature",
+        unit="C",
+        hypotheses=_THERMAL_HYPOTHESES,
+        cpu_workload_hypothesis_id="H1",
+        # Best Power Efficiency mode reducing CPU/GPU power draw is arguably
+        # the most direct use of this action yet: less power in, less heat
+        # out.
+        action_reason_label="elevated temperature",
+    ),
 }
+
+
+def _sentence_case(label: str) -> str:
+    """Upper-cases just the first character, preserving the rest -- unlike
+    str.capitalize(), which would turn "CPU utilization" into "Cpu
+    utilization"."""
+    return label[0].upper() + label[1:] if label else label
 
 
 def _build_suggested_action(reason_label: str, live_mean: float, baseline_mean: float, unit: str) -> SuggestedAction:
@@ -235,9 +296,9 @@ class DiagnosticAgent:
 
         if norm.result == "not_enough_history":
             return Diagnosis(
-                finding=f"Not enough accumulated history to evaluate {self.domain} anomalies yet.",
+                finding=f"Not enough accumulated history to evaluate {self._config.label} anomalies yet.",
                 confidence=1.0,
-                evidence=[f"check-{self.domain} reports '{norm.result}'"],
+                evidence=[f"check-{self._config.cli_name} reports '{norm.result}'"],
                 alternative_explanations=[],
                 recommended_action="none -- keep recording",
                 risk="n/a",
@@ -247,9 +308,9 @@ class DiagnosticAgent:
 
         if norm.result not in ("anomaly_opened", "anomaly_ongoing"):
             return Diagnosis(
-                finding=f"No active {self.domain} anomaly to diagnose.",
+                finding=f"No active {self._config.label} anomaly to diagnose.",
                 confidence=1.0,
-                evidence=[f"check-{self.domain} reports '{norm.result}'"],
+                evidence=[f"check-{self._config.cli_name} reports '{norm.result}'"],
                 alternative_explanations=[],
                 recommended_action="none",
                 risk="none",
@@ -296,7 +357,8 @@ class DiagnosticAgent:
 
         # cpu.utilization history is only a useful *correlate* for a non-CPU
         # anomaly -- for the cpu domain it would just restate evidence[self.domain]
-        # under a colliding "cpu" key.
+        # under a colliding "cpu" key. (top_cpu is a different metric --
+        # one process's CPU%, not the system total -- so it keeps this block.)
         if self.domain != "cpu":
             cpu_baseline = self.tools.get_metric_history("cpu.utilization", last_minutes=60 * 24)
             cpu_recent = self.tools.get_metric_history("cpu.utilization", last_minutes=5)
@@ -388,7 +450,7 @@ class DiagnosticAgent:
                         ),
                         risk="low -- this is a diagnosis only, no action was taken",
                         expected_result=(
-                            f"{self.domain.capitalize()} should return toward its "
+                            f"{_sentence_case(self._config.label)} should return toward its "
                             f"{evidence[self.domain]['baseline']}{self._config.unit} baseline."
                         ),
                         reasoned_by="rule-based",
@@ -402,8 +464,8 @@ class DiagnosticAgent:
                 evidence_lines.append("Not enough CPU history to evaluate CPU as a cause.")
 
         return Diagnosis(
-            finding=f"{self.domain.capitalize()} anomaly is confirmed abnormal, but current evidence "
-            "is insufficient to identify a specific cause.",
+            finding=f"{_sentence_case(self._config.label)} anomaly is confirmed abnormal, but "
+            "current evidence is insufficient to identify a specific cause.",
             confidence=0.1,
             evidence=evidence_lines,
             alternative_explanations=[h["description"] for h in self._config.hypotheses],
